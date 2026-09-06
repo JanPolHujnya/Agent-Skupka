@@ -15,9 +15,10 @@
 
 ### 1. Python
 
-Windows: [python.org](https://www.python.org/downloads/) 3.12+, галка **Add python.exe to PATH**.
+Нужен **3.10+** (лучше 3.12). pip-пакеты не нужны.
 
-Если лежит локальный `runtime\python.exe` (в git его нет) — скрипты запуска возьмут его.
+- Windows: [python.org](https://www.python.org/downloads/), галка **Add python.exe to PATH**. Если есть локальный `runtime\python.exe` — батники возьмут его.
+- Linux: `sudo apt install python3` (Debian/Ubuntu) или `sudo dnf install python3`.
 
 ### 2. Бот в Telegram
 
@@ -48,23 +49,42 @@ Windows: [python.org](https://www.python.org/downloads/) 3.12+, галка **Add
 
 ### 5. Конфиг бота
 
-```text
-copy .env.example .env
-```
+Windows: `copy .env.example .env`  
+Linux: `cp .env.example .env`
 
 Заполни `.env`. `ALLOWED_CHAT_ID` — числовые id, через запятую. Пустой список = никому нельзя.
 
 ### 6. Запуск
 
+**Windows**, в консоли (окно не закрывать):
+
 ```text
 start.bat
 ```
 
-Или вручную: `python bot.py`
+Автозапуск: `powershell -File install_task.ps1` (задача `UchetSkupBot`). Рестарт: `powershell -File launch.ps1`.
+
+**Linux / VPS** — входящих портов не надо, бот сам ходит в Telegram и Google по HTTPS.
+
+```text
+chmod +x *.sh
+./start.sh
+```
+
+Чтобы жил после выхода из ssh:
+
+```text
+sudo ./install-service.sh
+journalctl -u uchetskup-bot -f
+```
+
+без root: `./install-service.sh --user`  
+рестарт: `sudo systemctl restart uchetskup-bot`  
+снять: `sudo ./install-service.sh --remove`
+
+На машине без systemd можно так: `./launch.sh` (сторож в фоне, лог `data/watch.log`).
 
 В Telegram: `/start`.
-
-Автозапуск Windows: `powershell -File install_task.ps1` (задача `UchetSkupBot`). Рестарт: `powershell -File launch.ps1`.
 
 ## Структура
 
@@ -75,5 +95,6 @@ start.bat
 | `.env.example` | Шаблон секретов |
 | `SHEET.md` | Как разметить колонки |
 | `AGENTS.md` | Правила для AI-агентов |
-| `watch.bat` / `launch.ps1` | Сторож процесса на Windows |
-
+| `start.sh` `watch.sh` `launch.sh` | Запуск на Linux |
+| `install-service.sh` | systemd на сервере |
+| `watch.bat` / `launch.ps1` | Сторож на Windows |

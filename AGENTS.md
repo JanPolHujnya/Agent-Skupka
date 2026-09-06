@@ -23,6 +23,8 @@ Telegram-бот учёта железа + Google Sheets. Закуп, прода�
 | `data/` | jsonl / сессии / логи, gitignore |
 | `runtime/python.exe` | Опциональный embeddable Python, gitignore |
 | `watch.bat` `launch.ps1` `restart.ps1` `install_task.ps1` | Windows-запуск |
+| `start.sh` `watch.sh` `launch.sh` `restart.sh` | Linux-запуск |
+| `install-service.sh` | systemd (`uchetskup-bot`) |
 
 Нет `requirements.txt`, нет тестов. Не ставить pip в embeddable runtime без нужды.
 
@@ -47,6 +49,8 @@ Telegram-бот учёта железа + Google Sheets. Закуп, прода�
 powershell -NoProfile -File .\launch.ps1
 schtasks /Query /TN UchetSkupBot
 ```
+
+Linux / VPS: `./start.sh`, в фоне `./launch.sh`, сервис `sudo ./install-service.sh`. Не тащить токен в unit-файл — бот читает `.env` сам. Входящий порт не открывать (long poll).
 
 Убивать только процессы с `bot.py` / папкой проекта в CommandLine. Не `Stop-Process python` глобально.
 

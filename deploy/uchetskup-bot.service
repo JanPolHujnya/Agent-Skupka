@@ -1,0 +1,21 @@
+# пример unit. живой ставит install-service.sh (подставит пути).
+# sudo ./install-service.sh
+
+[Unit]
+Description=Учёт железа Telegram-бот
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=REPLACE_USER
+WorkingDirectory=/opt/motya-bot
+ExecStart=/usr/bin/python3 /opt/motya-bot/bot.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

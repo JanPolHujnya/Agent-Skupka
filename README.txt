@@ -1,6 +1,7 @@
 Учёт железа — Telegram-бот
 
-Запуск: start.bat (окно не закрывать) или python bot.py
+Windows: start.bat (окно не закрывать)
+Linux: ./start.sh   на сервере: sudo ./install-service.sh
 
 Полная инструкция: README.md
 Разметка таблицы: SHEET.md

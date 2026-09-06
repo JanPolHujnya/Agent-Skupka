@@ -13,6 +13,9 @@ import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+if sys.version_info < (3, 10):
+    raise SystemExit("Нужен Python 3.10+")
+
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 DATA.mkdir(exist_ok=True)
