@@ -1,0 +1,26 @@
+# secrets and live config
+.env
+.token
+sheets_webhook.private.gs
+*.local.gs
+
+# live ledger, sessions, logs — never publish
+data/*
+!data/.gitkeep
+!data/README.md
+
+# bundled Python and caches
+runtime/
+python-embed.zip
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# editor / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
