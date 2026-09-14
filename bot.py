@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import json
+import http.client
+import http.cookiejar
 import os
 import re
+import socket
+import ssl
 import sys
+import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -16,12 +22,24 @@ from pathlib import Path
 if sys.version_info < (3, 10):
     raise SystemExit("Нужен Python 3.10+")
 
+# VPS often has IPv6 DNS but no IPv6 route (sysctl disable_ipv6).
+# urllib then waits on unreachable AAAA before falling back to IPv4.
+_GA = socket.getaddrinfo
+
+
+def _ipv4_addrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _GA(host, port, socket.AF_INET, type, proto, flags)
+
+
+socket.getaddrinfo = _ipv4_addrinfo
+
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 DATA.mkdir(exist_ok=True)
 DEALS_PATH = DATA / "deals.jsonl"
 STATE_PATH = DATA / "state.json"
 LOG_PATH = DATA / "bot.log"
+UNSOLD_PATH = DATA / "unsold_cache.json"
 
 API = "https://api.telegram.org/bot{token}/{method}"
 
@@ -60,6 +78,18 @@ PAGE = 6
 HR = "────────"
 BUY_TOTAL = 10
 SELL_TOTAL = 11
+
+INV_KEY = "_inv"
+USERS_KEY = "_users"
+INV_OK = "ok"
+INV_MISS = "miss"
+INV_MONTHS = [
+    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+]
+INV_SHEET_OK = "✅ на месте"
+INV_SHEET_MISS = "❌ отсутствует"
+INV_SHEET_UNMARKED = "❌ не отмечено"
 
 
 def load_env():
@@ -152,6 +182,7 @@ def reply_kb():
             [{"text": "🛒 Закуп"}, {"text": "💸 Продажа"}],
             [{"text": "✏️ Лот"}, {"text": "💵 Деньги"}],
             [{"text": "💰 Касса"}, {"text": "Отменить последнее"}],
+            [{"text": "📋 Инвентаризация"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -261,7 +292,7 @@ def progress_line(kind, step):
         total = 4
         title = "Деньги"
     else:
-        titles = {"edit": "Лот", "kind": "Сделка"}
+        titles = {"edit": "Лот", "kind": "Сделка", "inv": "Инвентаризация"}
         return "<b>" + esc(titles.get(kind, kind or "Учёт")) + "</b>"
     n, _name = mapping.get(step, (1, ""))
     return "<b>%s</b>\n%s" % (title, dots(n, total))
@@ -291,6 +322,13 @@ def save_json(path: Path, obj) -> None:
 
 SESSIONS: dict[str, dict] = load_json(STATE_PATH, {})
 _CASH = {"t": 0.0, "data": None}
+_UNSOLD = {
+    "t": 0.0,
+    "items": None,
+    "lock": threading.Lock(),
+    "busy": False,
+    "done": threading.Event(),
+}
 
 
 def sid(chat_id) -> str:
@@ -495,6 +533,13 @@ def ingest_cash(payload: dict) -> None:
     )
 
 
+def peek_balance() -> dict:
+    cached = _CASH.get("data")
+    if cached:
+        return cached
+    return local_balance()
+
+
 def fetch_balance(force=False) -> dict:
     now = time.time()
     cached = _CASH.get("data")
@@ -522,23 +567,40 @@ def is_extra_deal(d: dict) -> bool:
 
 
 def last_action() -> dict | None:
+    acts = undoable_actions(1)
+    return acts[0] if acts else None
+
+
+def undoable_actions(limit: int = 15) -> list:
     deals = load_deals()
     undone = {str(d.get("undoes") or "") for d in deals if d.get("undoes")}
     undone.discard("")
+    out = []
     for d in reversed(deals):
         did = str(d.get("id") or "")
-        if not did or did in undone:
-            continue
-        if d.get("undoes"):
+        if not did or did in undone or d.get("undoes"):
             continue
         what = str(d.get("kassa_what") or "")
         if "Отмена" in what:
             continue
         if is_extra_deal(d):
             continue
-        if d.get("type") in ("buy", "sell", "cash"):
-            return d
-    return None
+        if d.get("type") not in ("buy", "sell", "cash"):
+            continue
+        out.append(d)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def undo_label(d: dict) -> str:
+    ico = {"buy": "🛒", "sell": "💸", "cash": "💵"}.get(d.get("type"), "•")
+    name = d.get("product") or d.get("note") or d.get("kassa_what") or "?"
+    label = "%s %s · %s" % (ico, name, fmt_money(d.get("amount") or 0))
+    date = str(d.get("date") or "")
+    if date:
+        label += " · " + date
+    return label[:64]
 
 
 def extras_for(deal: dict) -> list:
@@ -600,38 +662,173 @@ def reverse_cash_row(orig: dict, what: str, direction: str) -> None:
     push_sheets(extra)
 
 
-def sheets_call(payload: dict) -> dict:
+# у каждого действия свой обязательный ключ: по нему отличаем честный ответ
+# от чужого, который отдает CDN-кэш Apps Script (тот ключует по URL,
+# не глядя на метод и тело запроса)
+SHEETS_KEY = {
+    "unsold": "items",
+    "lots": "items",
+    "inv_list": "entries",
+    "inv_get": "items",
+    "balance": "hand",
+    "setup": "hand",
+    "write": "sheet_row",
+    "inv_start": "session_id",
+    "inv_save": "session_id",
+    "inv_update": "row",
+    "lot": "item",
+}
+SHEETS_FOREIGN = ("service", "hand", "items", "entries", "sheet_row", "item")
+
+# поход в таблицу стоит 2-9 с (скорость Apps Script), поэтому повторные
+# чтения в пределах 10 с берем из кэша. любое пишущее действие кэш сбрасывает
+SHEETS_READ = {"balance", "setup", "unsold", "lots", "lot", "inv_list", "inv_get"}
+SHEETS_CACHE_TTL = 10
+_sheets_cache: dict = {}
+
+
+class SheetsRedirect(urllib.request.HTTPRedirectHandler):
+    # Apps Script иногда отвечает 302 обратно на /exec (печёт cookie).
+    # по умолчанию urllib повторяет как GET — выполняется doGet вместо doPost
+    # и приходит {"ok":true,"service":...}. поэтому на script.google.com
+    # повторяем исходный POST, на googleusercontent (подписанный ответ) — GET.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if (
+            req.get_method() == "POST"
+            and code in (301, 302, 303, 307, 308)
+            and "script.google.com/macros" in newurl
+        ):
+            return urllib.request.Request(
+                newurl,
+                data=req.data,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                method="POST",
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+SHEETS_OPENER = urllib.request.build_opener(
+    SheetsRedirect(),
+    urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()),
+)
+_SHEETS_SSL = ssl.create_default_context()
+
+
+def _sheets_http(url: str, data: bytes, deadline: float) -> str:
+    # один дедлайн на всю цепочку 302, иначе каждый хоп ждёт свой timeout
+    method = "POST"
+    body = data
+    for _ in range(5):
+        left = deadline - time.time()
+        if left <= 0.2:
+            raise TimeoutError("sheets deadline")
+        p = urllib.parse.urlparse(url)
+        host = p.hostname
+        if not host:
+            raise OSError("bad sheets url")
+        path = p.path or "/"
+        if p.query:
+            path += "?" + p.query
+        conn = http.client.HTTPSConnection(
+            host, p.port or 443, timeout=left, context=_SHEETS_SSL
+        )
+        try:
+            hdrs = {}
+            if method == "POST":
+                hdrs["Content-Type"] = "application/json; charset=utf-8"
+            conn.request(method, path, body=body if method == "POST" else None, headers=hdrs)
+            resp = conn.getresponse()
+            raw = resp.read()
+            status = resp.status
+            loc = resp.getheader("Location") or ""
+        finally:
+            conn.close()
+        if status in (301, 302, 303, 307, 308) and loc:
+            url = urllib.parse.urljoin(url, loc)
+            if "script.google.com/macros" in url:
+                method = "POST"
+            else:
+                method = "GET"
+                body = None
+            continue
+        if status >= 400:
+            raise OSError("HTTP Error %s" % status)
+        return raw.decode("utf-8", "replace")
+    raise TimeoutError("sheets redirects")
+
+
+def sheets_call(payload: dict, attempts: int = 2, deadline_s: float = 8) -> dict:
     url = ENV.get("SHEETS_WEBHOOK") or ""
     if not url:
         return {"ok": False, "error": "local"}
-    body = dict(payload)
+    action = str(payload.get("action") or "")
+    key = SHEETS_KEY.get(action)
+    if action not in SHEETS_READ:
+        _sheets_cache.clear()
+    else:
+        hit = _sheets_cache.get(action)
+        if hit and time.time() - hit[0] < SHEETS_CACHE_TTL:
+            return hit[1]
     secret = ENV.get("WEBHOOK_SECRET") or ""
-    if secret:
-        body["secret"] = secret
-    raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=raw,
-        headers={"Content-Type": "application/json; charset=utf-8"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=40) as resp:
-            text = resp.read().decode("utf-8", "replace")
-            log("sheets: " + text[:240])
+    err = ""
+    t_all = time.time()
+    ntry = max(1, int(attempts))
+    for attempt in range(1, ntry + 1):
+        body = dict(payload)
+        if secret:
+            body["secret"] = secret
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        sep = "&" if "?" in url else "?"
+        t0 = time.time()
+        try:
+            text = _sheets_http(
+                url + sep + "cb=" + str(time.time_ns()), raw, time.time() + deadline_s
+            )
+            log("sheets %.1fs %s: %s" % (time.time() - t0, action, text[:240]))
             try:
                 data = json.loads(text)
-                if isinstance(data, dict):
-                    ingest_cash(data)
-                    return data
             except json.JSONDecodeError:
-                pass
-            if "ok" in text.lower() and "forbidden" not in text.lower():
-                return {"ok": True, "raw": text}
-            return {"ok": False, "error": text[:80]}
-    except Exception as e:
-        log("sheets fail: %s" % e)
-        return {"ok": False, "error": str(e)}
+                data = None
+            if not isinstance(data, dict):
+                err = "не json: " + text[:60]
+                continue
+            if data.get("error") == "forbidden":
+                return data
+            poisoned = bool(data.get("ok")) and (
+                data.get("service")
+                or (key and key not in data)
+                or (not key and any(m in data for m in SHEETS_FOREIGN))
+            )
+            if poisoned:
+                err = "кэш отдал чужой ответ"
+                log("sheets %.1fs %s poisoned, retry" % (time.time() - t0, action))
+                continue
+            if data.get("ok") and action in SHEETS_READ:
+                _sheets_cache[action] = (time.time(), data)
+            ingest_cash(data)
+            return data
+        except Exception as e:
+            err = str(e)
+            log("sheets fail %.1fs %s try%d: %s" % (time.time() - t0, action, attempt, e))
+            # 404/чужой кэш — сразу ещё раз. пауза только если google завис
+            if "timed out" in err.lower() or "timeout" in err.lower():
+                time.sleep(0.3)
+            continue
+    log("sheets err %s after %.1fs: %s" % (action, time.time() - t_all, err[:120]))
+    return {"ok": False, "error": err[:80]}
+
+
+def _sheets_keepwarm():
+    # Apps Script остывает и первый POST идёт 10-15 с в 404/CDN.
+    time.sleep(1)
+    _unsold_from_disk()
+    while True:
+        try:
+            sheets_call({"action": "setup"}, attempts=1, deadline_s=8)
+            _unsold_refresh(block=True)
+        except Exception as e:
+            log("sheets warm fail: %s" % e)
+        time.sleep(120)
 
 
 def push_sheets(deal: dict) -> str:
@@ -643,14 +840,94 @@ def push_sheets(deal: dict) -> str:
     return str(r.get("error") or "fail")[:80]
 
 
+def _unsold_from_disk() -> None:
+    if _UNSOLD["items"] is not None:
+        return
+    try:
+        raw = json.loads(UNSOLD_PATH.read_text(encoding="utf-8"))
+        items = raw.get("items")
+        if isinstance(items, list):
+            _UNSOLD["items"] = items
+            _UNSOLD["t"] = float(raw.get("t") or 0)
+            log("unsold disk %s шт. age=%.0fs" % (len(items), time.time() - _UNSOLD["t"]))
+    except Exception:
+        pass
+
+
+def _unsold_to_disk(items: list) -> None:
+    try:
+        UNSOLD_PATH.write_text(
+            json.dumps({"t": time.time(), "items": items}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _unsold_set(items: list) -> None:
+    _UNSOLD["items"] = items
+    _UNSOLD["t"] = time.time()
+    _unsold_to_disk(items)
+
+
+def _unsold_drop_row(row) -> None:
+    try:
+        row = int(row or 0)
+    except (TypeError, ValueError):
+        return
+    items = _UNSOLD.get("items")
+    if not items or not row:
+        return
+    nxt = [it for it in items if int(it.get("row") or 0) != row]
+    if len(nxt) != len(items):
+        _unsold_set(nxt)
+
+
+def _unsold_refresh(block: bool = False) -> None:
+    start = False
+    with _UNSOLD["lock"]:
+        if not _UNSOLD["busy"]:
+            _UNSOLD["busy"] = True
+            _UNSOLD["done"] = threading.Event()
+            start = True
+        ev = _UNSOLD["done"]
+
+    def worker():
+        try:
+            r = sheets_call({"action": "unsold"}, attempts=2, deadline_s=20)
+            items = r.get("items") if r.get("ok") else None
+            if isinstance(items, list):
+                _unsold_set(items)
+                log("unsold refresh %s шт." % len(items))
+        except Exception as e:
+            log("unsold refresh fail: %s" % e)
+        finally:
+            _UNSOLD["busy"] = False
+            ev.set()
+
+    if start:
+        if block:
+            worker()
+            return
+        threading.Thread(target=worker, name="unsold-refresh", daemon=True).start()
+    if block:
+        ev.wait(15)
+
+
 def fetch_unsold() -> list | None:
-    r = sheets_call({"action": "unsold"})
-    if r.get("error") == "local":
-        return None
-    if not r.get("ok"):
-        return None
-    items = r.get("items") or []
-    return items if isinstance(items, list) else []
+    _unsold_from_disk()
+    now = time.time()
+    items = _UNSOLD.get("items")
+    age = now - (_UNSOLD.get("t") or 0)
+    if items is not None and age < 300:
+        if age > 60:
+            _unsold_refresh(block=False)
+        return items
+    if items is not None:
+        _unsold_refresh(block=False)
+        return items
+    _unsold_refresh(block=True)
+    return _UNSOLD.get("items")
 
 
 def fetch_lots(mode="all", query="") -> list | None:
@@ -661,6 +938,71 @@ def fetch_lots(mode="all", query="") -> list | None:
         return None
     items = r.get("items") or []
     return items if isinstance(items, list) else []
+
+
+def fetch_inv_list() -> list | None:
+    r = sheets_call({"action": "inv_list"})
+    if r.get("error") == "local" or not r.get("ok"):
+        return None
+    items = r.get("entries") or []
+    return items if isinstance(items, list) else []
+
+
+def fetch_inv_get(session_id) -> list | None:
+    r = sheets_call({"action": "inv_get", "session_id": session_id})
+    if r.get("error") == "local" or not r.get("ok"):
+        return None
+    items = r.get("items") or []
+    return items if isinstance(items, list) else []
+
+
+def inv_state():
+    inv = SESSIONS.get(INV_KEY)
+    if isinstance(inv, dict) and inv.get("active"):
+        return inv
+    return None
+
+
+def remember_user(chat_id, u: dict) -> None:
+    frm = (u.get("message") or u.get("callback_query") or {}).get("from") or {}
+    name = ""
+    if frm.get("username"):
+        name = "@" + str(frm["username"])
+    elif frm.get("first_name"):
+        name = str(frm["first_name"])
+    if not name:
+        return
+    users = SESSIONS.get(USERS_KEY)
+    if not isinstance(users, dict):
+        users = {}
+        SESSIONS[USERS_KEY] = users
+    if users.get(sid(chat_id)) != name:
+        users[sid(chat_id)] = name
+        persist_sess()
+
+
+def user_name(chat_id) -> str:
+    users = SESSIONS.get(USERS_KEY)
+    if isinstance(users, dict):
+        return str(users.get(sid(chat_id)) or "") or "неизвестный"
+    return "неизвестный"
+
+
+def period_str(d=None) -> str:
+    d = d or date.today()
+    return d.strftime("%m.%Y")
+
+
+def period_label(period: str) -> str:
+    period = str(period or "")
+    parts = period.split(".")
+    try:
+        m = int(parts[0])
+    except (ValueError, IndexError):
+        return period or "?"
+    name = INV_MONTHS[m - 1] if 1 <= m <= 12 else period
+    year = parts[1] if len(parts) > 1 else ""
+    return name + (" " + str(year) if year else "")
 
 
 def kassa_what(deal: dict) -> str:
@@ -773,7 +1115,7 @@ def card(deal: dict) -> str:
 
 
 def menu_text(info=None) -> str:
-    info = info or fetch_balance()
+    info = info or peek_balance()
     hand = fmt_money(info.get("hand") or 0)
     src = "как в таблице «На руках»" if info.get("source") == "sheet" else "по записям бота"
     return (
@@ -784,7 +1126,7 @@ def menu_text(info=None) -> str:
         + "</code>\n<i>"
         + src
         + "</i>\n\n"
-        + "кнопки внизу экрана — закуп, продажа, лот, деньги, касса"
+        + "кнопки внизу — закуп, продажа, лот, деньги, касса, инвентаризация"
     )
 
 
@@ -868,8 +1210,7 @@ def ui(chat_id, text, markup=None, force_new=False):
 
 def go_menu(chat_id, prefix=""):
     clear_sess(chat_id)
-    info = fetch_balance()
-    body = menu_text(info)
+    body = menu_text(peek_balance())
     if prefix:
         body = prefix + "\n\n" + body
     send(chat_id, body, reply_kb())
@@ -902,6 +1243,12 @@ def go_back(chat_id):
     s = sess(chat_id)
     step = s.get("step") or "idle"
     kind = s.get("type")
+    if kind == "undo":
+        if step == "undo_list":
+            start_undo(chat_id)
+        else:
+            show_undo_list(chat_id, s.get("undo_page") or 0)
+        return
     if kind == "edit":
         if step in ("edit_item", "edit_how", "pick", "search", "sell_cat"):
             start_edit(chat_id)
@@ -982,6 +1329,27 @@ def go_back(chat_id):
         else:
             go_menu(chat_id)
         return
+    if kind == "inv":
+        mine = inv_state() and inv_state().get("by") == chat_id
+        if step == "inv_item":
+            inv_list(chat_id, s.get("page") or 0)
+        elif step == "inv_list":
+            inv_categories(chat_id) if mine else go_menu(chat_id)
+        elif step in ("inv_cats", "inv_home", "inv_begin"):
+            inv_home(chat_id) if mine else go_menu(chat_id)
+        elif step in ("inv_fin", "inv_cx"):
+            inv_categories(chat_id) if mine else go_menu(chat_id)
+        elif step == "inv_search":
+            inv_list(chat_id, 0)
+        elif step == "inv_month":
+            inv_month_view(chat_id, s.get("inv_sid") or 0, s.get("inv_page") or 0)
+        elif step == "inv_months":
+            go_menu(chat_id)
+        elif step == "inv_fix":
+            inv_month_view(chat_id, s.get("inv_sid") or 0, s.get("inv_page") or 0)
+        else:
+            go_menu(chat_id)
+        return
     go_menu(chat_id)
 
 
@@ -1013,25 +1381,95 @@ def undo_explain(deal: dict) -> str:
 
 
 def start_undo(chat_id):
-    deal = last_action()
-    if not deal:
+    acts = undoable_actions()
+    if not acts:
         send(chat_id, "отменять нечего — последнего действия нет.", reply_kb())
         return
+    deal = acts[0]
     s = sess(chat_id)
     SESSIONS[sid(chat_id)] = {
         "step": "undo_confirm",
         "type": "undo",
         "undo_item": deal,
+        "undo_list": acts,
+        "undo_page": 0,
         "msg_id": s.get("msg_id"),
     }
     persist_sess()
+    rows = [[btn("да, отменить это", "un:yes")]]
+    if len(acts) > 1:
+        rows.append([btn("выбрать из списка", "un:list")])
+    rows.append([btn("нет", "un:no")])
     ui(
         chat_id,
         "<b>Отменить последнее?</b>\n\n"
         + card(deal)
         + "\n\n"
-        + undo_explain(deal),
-        kb([[btn("да, отменить", "un:yes")], [btn("нет", "un:no")]]),
+        + undo_explain(deal)
+        + ("\n\n<i>если это не то — выбери из списка</i>" if len(acts) > 1 else ""),
+        kb(rows),
+        force_new=True,
+    )
+
+
+UNDO_PAGE = 6
+
+
+def show_undo_list(chat_id, page=0):
+    s = sess(chat_id)
+    acts = s.get("undo_list") or undoable_actions()
+    if not acts:
+        send(chat_id, "отменять нечего.", reply_kb())
+        return
+    s["undo_list"] = acts
+    s["step"] = "undo_list"
+    page = max(0, int(page or 0))
+    max_page = max(0, (len(acts) - 1) // UNDO_PAGE)
+    if page > max_page:
+        page = max_page
+    s["undo_page"] = page
+    persist_sess()
+    chunk = acts[page * UNDO_PAGE : (page + 1) * UNDO_PAGE]
+    rows = []
+    base = page * UNDO_PAGE
+    for i, d in enumerate(chunk):
+        rows.append([btn(undo_label(d), "un:i:%d" % (base + i))])
+    nav = []
+    if page > 0:
+        nav.append(btn("‹", "un:pg:%d" % (page - 1)))
+    nav.append(btn("%d / %d" % (page + 1, max_page + 1), "un:pg:%d" % page))
+    if page < max_page:
+        nav.append(btn("›", "un:pg:%d" % (page + 1)))
+    rows.append(nav)
+    rows.append([btn("‹ к последнему", "un:last"), btn("✕ Отмена", "m:cancel")])
+    ui(
+        chat_id,
+        "<b>Что отменить?</b>\n\nпоследние %d действий. нажми нужное." % len(acts),
+        kb(rows),
+    )
+
+
+def confirm_undo_pick(chat_id, idx: int):
+    s = sess(chat_id)
+    acts = s.get("undo_list") or undoable_actions()
+    if idx < 0 or idx >= len(acts):
+        show_undo_list(chat_id, s.get("undo_page") or 0)
+        return
+    deal = acts[idx]
+    s["undo_item"] = deal
+    s["undo_list"] = acts
+    s["step"] = "undo_confirm"
+    persist_sess()
+    ui(
+        chat_id,
+        "<b>Отменить это?</b>\n\n" + card(deal) + "\n\n" + undo_explain(deal),
+        kb(
+            [
+                [btn("да, отменить", "un:yes")],
+                [btn("‹ к списку", "un:list")],
+                [btn("нет", "un:no")],
+            ]
+        ),
     )
 
 
@@ -1156,7 +1594,8 @@ def perform_undo(chat_id):
             )
             notes.append("по кассе нечего сторнировать")
     _CASH["t"] = 0
-    info = fetch_balance(force=True)
+    _CASH["data"] = None
+    info = local_balance()
     go_menu(
         chat_id,
         "отменил.\n\n"
@@ -1310,19 +1749,25 @@ def show_item_list(chat_id, page=0, force_new=False):
 
 
 def load_unsold_or_fail(chat_id) -> bool:
-    ui(chat_id, "смотрю таблицу…")
     items = fetch_unsold()
     if items is None:
-        ui(chat_id, "таблица не отвечает. попробуй ещё раз.", force_new=True)
-        clear_sess(chat_id)
-        go_menu(chat_id)
+        ui(
+            chat_id,
+            screen("sell", "sell_how", "таблица сейчас не отвечает.\nнажми ещё раз через пару секунд."),
+            kb(
+                [
+                    [btn("📂 по категории", "m:cats")],
+                    [btn("🔍 поиск по слову", "m:search")],
+                    [btn("📋 все не проданные", "c:all")],
+                    nav_row(),
+                ]
+            ),
+        )
         return False
     sess(chat_id)["unsold"] = items
     persist_sess()
     if not items:
-        ui(chat_id, "в таблице нет не проданного товара.", force_new=True)
-        clear_sess(chat_id)
-        go_menu(chat_id)
+        send(chat_id, "в таблице нет не проданного товара.", reply_kb())
         return False
     return True
 
@@ -1331,8 +1776,8 @@ def ask_sell_how(chat_id):
     s = sess(chat_id)
     s["step"] = "sell_how"
     persist_sess()
-    if not load_unsold_or_fail(chat_id):
-        return
+    _unsold_from_disk()
+    _unsold_refresh(block=False)
     ui(
         chat_id,
         screen("sell", "sell_how", "как ищем, что продаём?"),
@@ -1344,6 +1789,7 @@ def ask_sell_how(chat_id):
                 nav_row(),
             ]
         ),
+        force_new=True,
     )
 
 
@@ -1665,6 +2111,8 @@ def show_edit_item(chat_id):
 
 
 def commit(chat_id):
+    ui(chat_id, "записываю…", kb([cancel_row()]))
+
     s = sess(chat_id)
     deal = {
         "id": datetime.now().strftime("%Y%m%d%H%M%S"),
@@ -1696,6 +2144,8 @@ def commit(chat_id):
     wr = sheets_call(dict(deal, action="write"))
     if wr.get("ok") and wr.get("sheet_row"):
         deal["sheet_row"] = wr.get("sheet_row")
+    if deal.get("type") == "sell":
+        _unsold_drop_row(deal.get("sheet_row"))
     sheets = "ok" if wr.get("ok") else (wr.get("error") or "fail")
     if sheets == "local" or wr.get("error") == "local":
         sheets = "local"
@@ -1715,7 +2165,8 @@ def commit(chat_id):
             append_deal(extra_d)
             push_sheets(extra_d)
     _CASH["t"] = 0
-    info = fetch_balance(force=True)
+    _CASH["data"] = None
+    info = local_balance()
     extra = ""
     if sheets == "local":
         extra = "\n<i>пока записано у бота. таблица подключится, когда будет вебхук.</i>"
@@ -1760,7 +2211,7 @@ def set_date_and_continue(chat_id, ds: str):
             ui(chat_id, "дата обновлена: <b>" + ds + "</b>")
             show_edit_item(chat_id)
         else:
-            ui(chat_id, "не смог записать дату.", force_new=True)
+            ui(chat_id, "не смог записать дату.")
             go_menu(chat_id)
         return
     s["date"] = ds
@@ -1776,21 +2227,21 @@ def apply_edit_text(chat_id, text: str):
     it = s.setdefault("edit_item", {})
     if field == "name":
         if len(text) < 2:
-            send(chat_id, "слишком коротко.")
+            ui(chat_id, "слишком коротко.", kb([nav_row()]))
             return
         fields["product"] = text[:80]
         it["product"] = text[:80]
     elif field == "cost":
         n = parse_amount(text)
         if n is None:
-            send(chat_id, "напиши число, например 8500")
+            ui(chat_id, "напиши число, например 8500", kb([nav_row()]))
             return
         fields["cost"] = n
         it["cost"] = n
     elif field == "sale":
         n = parse_amount(text)
         if n is None:
-            send(chat_id, "напиши число, например 8500")
+            ui(chat_id, "напиши число, например 8500", kb([nav_row()]))
             return
         fields["sale"] = n
         it["sale"] = n
@@ -1810,23 +2261,23 @@ def apply_edit_text(chat_id, text: str):
     elif field == "delivery":
         n = parse_amount(text)
         if n is None:
-            send(chat_id, "напиши число, например 400")
+            ui(chat_id, "напиши число, например 400", kb([nav_row()]))
             return
         fields["delivery"] = n
         it["delivery"] = n
     elif field == "consumable":
         n = parse_amount(text)
         if n is None:
-            send(chat_id, "напиши число, например 150")
+            ui(chat_id, screen(s.get("type"), s.get("step") or "amount", "напиши число, например 150"), kb([nav_row()]))
             return
         fields["consumable"] = n
         it["consumable"] = n
     else:
-        send(chat_id, "не понял, что правим. нажми /start")
+        go_menu(chat_id, "не понял, что правим.")
         return
     r = sheets_call({"action": "update", "sheet_row": row, "fields": fields})
     if not r.get("ok"):
-        send(chat_id, "в таблицу не ушло.")
+        ui(chat_id, "в таблицу не ушло.", kb([nav_row()]))
         return
     s["edit_field"] = None
     persist_sess()
@@ -1879,11 +2330,14 @@ def on_text(chat_id, text: str):
     if text == "/undo" or cmd in ("отменить последнее", "отменить действие"):
         start_undo(chat_id)
         return
+    if text == "/inv" or text == "/inventory" or cmd in ("инвентаризация", "инвентаризации"):
+        start_inventory(chat_id)
+        return
     s = sess(chat_id)
     step = s.get("step") or "idle"
     if step == "product":
         if len(text) < 2:
-            send(chat_id, "слишком коротко. напиши название товара.")
+            ui(chat_id, screen("buy", "product", "слишком коротко. напиши название товара."), kb([nav_row()]))
             return
         s["product"] = text[:80]
         persist_sess()
@@ -1892,7 +2346,7 @@ def on_text(chat_id, text: str):
     if step == "amount":
         n = parse_amount(text)
         if n is None:
-            send(chat_id, "не понял сумму. напиши число, например 8500")
+            ui(chat_id, screen(s.get("type"), "amount", "не понял сумму. напиши число, например 8500"), kb([nav_row()]))
             return
         s["amount"] = n
         persist_sess()
@@ -1904,7 +2358,7 @@ def on_text(chat_id, text: str):
     if step == "delivery_amt":
         n = parse_amount(text)
         if n is None:
-            send(chat_id, "напиши число, например 400")
+            ui(chat_id, screen(s.get("type"), "delivery_amt", "напиши число, например 400"), kb([nav_row()]))
             return
         s["delivery"] = n
         persist_sess()
@@ -1913,7 +2367,7 @@ def on_text(chat_id, text: str):
     if step == "cons_amt":
         n = parse_amount(text)
         if n is None:
-            send(chat_id, "напиши число, например 150")
+            ui(chat_id, screen(s.get("type"), s.get("step") or "amount", "напиши число, например 150"), kb([nav_row()]))
             return
         s["consumable"] = n
         persist_sess()
@@ -1921,7 +2375,7 @@ def on_text(chat_id, text: str):
         return
     if step == "role_other":
         if len(text) < 2:
-            send(chat_id, "слишком коротко.")
+            ui(chat_id, screen(s.get("type"), "role_other", "слишком коротко."), kb([nav_row()]))
             return
         s["role"] = text[:80]
         s["role_pct"] = None
@@ -1930,7 +2384,7 @@ def on_text(chat_id, text: str):
         return
     if step == "search":
         if len(text) < 1:
-            send(chat_id, "напиши хотя бы пару символов.")
+            ui(chat_id, screen(s.get("type"), "search", "напиши хотя бы пару символов."), kb([nav_row()]))
             return
         s["query"] = text[:40]
         s["filter_cat"] = s.get("filter_cat") or "all"
@@ -1938,16 +2392,25 @@ def on_text(chat_id, text: str):
         if s.get("type") == "edit":
             items = fetch_lots("all", s["query"])
             if items is None:
-                send(chat_id, "таблица не отвечает.")
+                ui(chat_id, "таблица не отвечает.", kb([nav_row()]))
                 return
             s["lots"] = items
             persist_sess()
-        show_item_list(chat_id, 0, force_new=True)
+        show_item_list(chat_id, 0)
+        return
+    if step == "inv_search":
+        if len(text) < 1:
+            ui(chat_id, "напиши хотя бы пару символов.", kb([nav_row()]))
+            return
+        s["query"] = text[:40]
+        s["filter_cat"] = s.get("filter_cat") or "all"
+        persist_sess()
+        inv_list(chat_id, 0)
         return
     if step == "date_custom":
         ds = parse_date(text)
         if not ds:
-            send(chat_id, "не понял дату. пример: 06.09.2026")
+            ui(chat_id, screen(s.get("type"), "date_custom", "не понял дату. пример: 06.09.2026"), kb([nav_row()]))
             return
         set_date_and_continue(chat_id, ds)
         return
@@ -2025,7 +2488,7 @@ def load_edit_list(chat_id, mode: str):
     ui(chat_id, "смотрю таблицу…")
     items = fetch_lots(mode)
     if items is None:
-        ui(chat_id, "таблица не отвечает.", force_new=True)
+        ui(chat_id, "таблица не отвечает.")
         go_menu(chat_id)
         return
     s = sess(chat_id)
@@ -2035,10 +2498,773 @@ def load_edit_list(chat_id, mode: str):
     s["query"] = ""
     persist_sess()
     if not items:
-        ui(chat_id, "пусто.", force_new=True)
+        ui(chat_id, "пусто.")
         go_menu(chat_id)
         return
     show_item_list(chat_id, 0)
+
+
+def inv_counts(inv):
+    marks = inv.get("marks") or {}
+    ok = sum(1 for v in marks.values() if v == INV_OK)
+    miss = sum(1 for v in marks.values() if v == INV_MISS)
+    return len(inv.get("items") or []), ok, miss
+
+
+def inv_guard(chat_id) -> bool:
+    inv = inv_state()
+    if not inv:
+        start_inventory(chat_id)
+        return False
+    if inv.get("by") != chat_id:
+        inv_foreign(chat_id, inv)
+        return False
+    return True
+
+
+def inv_item_card(it, mark=None) -> str:
+    rows = [lot_card(it)]
+    cur = {INV_OK: "✅ на месте", INV_MISS: "❌ отсутствует"}.get(mark or "")
+    if cur:
+        rows.append("")
+        rows.append("Инвентаризация: <b>" + cur + "</b>")
+    return "\n".join(rows)
+
+
+def inv_item_label(it, mark) -> str:
+    icon = {INV_OK: "✅", INV_MISS: "❌"}.get(mark or "", "⬜")
+    name = str(it.get("product") or "?")
+    tail = fmt_money(it.get("cost") or 0)
+    room = 58 - len(icon) - len(tail) - 3
+    if len(name) > room:
+        name = name[: max(8, room)]
+    return ("%s %s · %s" % (icon, name, tail))[:64]
+
+
+def start_inventory(chat_id):
+    inv = inv_state()
+    if inv:
+        if inv.get("by") == chat_id:
+            inv_home(chat_id)
+        else:
+            inv_foreign(chat_id, inv)
+        return
+    s = sess(chat_id)
+    SESSIONS[sid(chat_id)] = {"step": "inv_begin", "type": "inv", "msg_id": s.get("msg_id")}
+    persist_sess()
+    items = fetch_unsold()
+    if not items:
+        ui(
+            chat_id,
+            "<b>Инвентаризация</b>\n\nсписок лотов сейчас недоступен.\nможно открыть прошлые инвентаризации.",
+            kb([[btn("📜 прошлые", "iv:hist")], [btn("↻ ещё раз", "m:inv")], [btn("‹ меню", "m:cancel")]]),
+            force_new=True,
+        )
+        return
+    s = sess(chat_id)
+    s["unsold"] = items
+    s["filter_cat"] = "all"
+    s["query"] = ""
+    persist_sess()
+    ui(
+        chat_id,
+        "<b>Инвентаризация</b>\n"
+        + HR
+        + "\nнепроданных лотов: <b>"
+        + str(len(items))
+        + "</b>\nпройди по коробкам и отметь, что на месте.\nне отмеченное посчитаю отсутствующим.",
+        kb(
+            [
+                [btn("▶️ начать", "iv:begin")],
+                [btn("📜 прошлые", "iv:hist")],
+                [btn("‹ меню", "m:cancel")],
+            ]
+        ),
+        force_new=True,
+    )
+
+
+def inv_home(chat_id):
+    inv = inv_state()
+    if not inv:
+        start_inventory(chat_id)
+        return
+    s = sess(chat_id)
+    SESSIONS[sid(chat_id)] = {
+        "step": "inv_home",
+        "type": "inv",
+        "msg_id": s.get("msg_id"),
+        "unsold": inv.get("items") or [],
+        "filter_cat": "all",
+        "query": "",
+        "page": 0,
+    }
+    persist_sess()
+    total, ok, miss = inv_counts(inv)
+    started = str(inv.get("started") or "")[:16].replace("T", " ")
+    ui(
+        chat_id,
+        "<b>Инвентаризация идёт</b>\n"
+        + HR
+        + "\nначал "
+        + esc(str(inv.get("by_name") or ""))
+        + " · "
+        + started
+        + "\nотмечено <b>"
+        + str(ok + miss)
+        + "</b> из <b>"
+        + str(total)
+        + "</b> · ✅ "
+        + str(ok)
+        + " · ❌ "
+        + str(miss),
+        kb(
+            [
+                [btn("продолжить", "iv:cats")],
+                [btn("🏁 завершить", "iv:fin")],
+                [btn("📜 прошлые", "iv:hist")],
+                [btn("🚪 отменить инвентаризацию", "iv:cxo")],
+            ]
+        ),
+    )
+
+
+def inv_foreign(chat_id, inv):
+    total, ok, miss = inv_counts(inv)
+    started = str(inv.get("started") or "")[:16].replace("T", " ")
+    ui(
+        chat_id,
+        "<b>Инвентаризация уже идёт</b>\n"
+        + HR
+        + "\nначал "
+        + esc(str(inv.get("by_name") or ""))
+        + " · "
+        + started
+        + "\nотмечено "
+        + str(ok + miss)
+        + " из "
+        + str(total)
+        + "\n\nвторую не начну — дождись завершения.",
+        kb([[btn("📜 прошлые", "iv:hist")], [btn("‹ меню", "m:cancel")]]),
+    )
+
+
+def inv_begin(chat_id):
+    inv = inv_state()
+    if inv:
+        if inv.get("by") == chat_id:
+            inv_home(chat_id)
+        else:
+            inv_foreign(chat_id, inv)
+        return
+    s = sess(chat_id)
+    items = s.get("unsold") or fetch_unsold() or []
+    if not items:
+        start_inventory(chat_id)
+        return
+    name = user_name(chat_id)
+    ui(chat_id, "открываю инвентаризацию…")
+    r = sheets_call({"action": "inv_start", "who": name}, attempts=1, deadline_s=12)
+    session_id = 0
+    if r.get("ok"):
+        try:
+            session_id = int(r.get("session_id") or 0)
+        except (TypeError, ValueError):
+            session_id = 0
+    snapshot = [
+        {
+            "row": int(it.get("row") or 0),
+            "product": str(it.get("product") or ""),
+            "category": str(it.get("category") or "Другое"),
+            "lot": str(it.get("lot") or ""),
+            "buy": str(it.get("buy") or ""),
+            "cost": int(it.get("cost") or 0),
+        }
+        for it in items
+    ]
+    SESSIONS[INV_KEY] = {
+        "active": True,
+        "by": chat_id,
+        "by_name": name,
+        "started": datetime.now().isoformat(timespec="seconds"),
+        "session_id": session_id,
+        "items": snapshot,
+        "marks": {},
+    }
+    persist_sess()
+    inv_categories(chat_id)
+
+
+def inv_categories(chat_id):
+    if not inv_guard(chat_id):
+        return
+    inv = inv_state()
+    items = inv.get("items") or []
+    s = sess(chat_id)
+    s["step"] = "inv_cats"
+    s["unsold"] = items
+    s["filter_cat"] = "all"
+    s["query"] = ""
+    s["page"] = 0
+    persist_sess()
+    counts = cat_counts(items)
+    rows = []
+    pair = []
+    names = [c for c in CATS if counts.get(c)]
+    extra = [c for c in sorted(counts) if c not in CATS]
+    for name in names + extra:
+        pair.append(btn(cat_label(name, counts[name]), "iv:c:" + name[:24]))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([btn("все · %s" % len(items), "iv:c:all")])
+    rows.append([btn("🏁 завершить", "iv:fin")])
+    rows.append(nav_row())
+    total, ok, miss = inv_counts(inv)
+    ui(
+        chat_id,
+        "<b>Инвентаризация</b>\nотмечено %d из %d · ✅ %d · ❌ %d\n\nчто смотрим?"
+        % (ok + miss, total, ok, miss),
+        kb(rows),
+    )
+
+
+def inv_list(chat_id, page=0, force_new=False):
+    if not inv_guard(chat_id):
+        return
+    inv = inv_state()
+    s = sess(chat_id)
+    items = filtered_items(s)
+    marks = inv.get("marks") or {}
+    if not items:
+        ui(chat_id, "по этому фильтру ничего нет.", kb([[btn("‹ категории", "iv:cats")]]))
+        return
+    page = max(0, page)
+    max_page = max(0, (len(items) - 1) // PAGE)
+    if page > max_page:
+        page = max_page
+    s["page"] = page
+    s["step"] = "inv_list"
+    persist_sess()
+    rows = []
+    for it in items[page * PAGE : (page + 1) * PAGE]:
+        mark = marks.get(str(it.get("row")))
+        rows.append([btn(inv_item_label(it, mark), "iv:it:" + str(it.get("row")))])
+    nav = []
+    if page > 0:
+        nav.append(btn("‹", "iv:pg:%d" % (page - 1)))
+    nav.append(btn("%d / %d" % (page + 1, max_page + 1), "iv:pg:%d" % page))
+    if page < max_page:
+        nav.append(btn("›", "iv:pg:%d" % (page + 1)))
+    rows.append(nav)
+    rows.append([btn("‹ категории", "iv:cats"), btn("🔍 поиск", "iv:srch")])
+    rows.append([btn("🏁 завершить", "iv:fin")])
+    total, ok, miss = inv_counts(inv)
+    q = s.get("query") or ""
+    cat = s.get("filter_cat")
+    bits = ["%s шт." % len(items)]
+    if cat and cat != "all":
+        bits.append(cat)
+    if q:
+        bits.append("«" + q + "»")
+    ui(
+        chat_id,
+        "<b>Инвентаризация</b>\nотмечено %d из %d · ✅ %d · ❌ %d\n\n%s"
+        % (ok + miss, total, ok, miss, " · ".join(bits)),
+        kb(rows),
+        force_new=force_new,
+    )
+
+
+def inv_ask_search(chat_id):
+    s = sess(chat_id)
+    s["step"] = "inv_search"
+    persist_sess()
+    ui(
+        chat_id,
+        "<b>Инвентаризация</b>\n\nнапиши кусок названия.\nнапример: <code>580</code> или <code>xeon</code>",
+        kb([[btn("‹ к списку", "iv:cats")]]),
+    )
+
+
+def inv_item(chat_id, row: int):
+    if not inv_guard(chat_id):
+        return
+    inv = inv_state()
+    picked = None
+    for it in inv.get("items") or []:
+        if int(it.get("row") or 0) == row:
+            picked = it
+            break
+    if not picked:
+        ui(chat_id, "лот не в списке инвентаризации.")
+        inv_list(chat_id, sess(chat_id).get("page") or 0)
+        return
+    s = sess(chat_id)
+    s["step"] = "inv_item"
+    s["inv_row"] = row
+    persist_sess()
+    marks = inv.get("marks") or {}
+    ui(
+        chat_id,
+        inv_item_card(picked, marks.get(str(row))),
+        kb(
+            [
+                [btn("✔️ на месте", "iv:ok:" + str(row)), btn("❌ отсутствует", "iv:no:" + str(row))],
+                [btn("‹ к списку", "iv:back")],
+            ]
+        ),
+    )
+
+
+def inv_mark(chat_id, row: int, mark: str):
+    if not inv_guard(chat_id):
+        return
+    inv = inv_state()
+    marks = inv.setdefault("marks", {})
+    marks[str(row)] = mark
+    persist_sess()
+    inv_list(chat_id, sess(chat_id).get("page") or 0)
+
+
+def inv_finish(chat_id):
+    if not inv_guard(chat_id):
+        return
+    inv = inv_state()
+    s = sess(chat_id)
+    s["step"] = "inv_fin"
+    persist_sess()
+    total, ok, miss = inv_counts(inv)
+    unmarked = total - ok - miss
+    rows = [
+        "🏁 <b>Завершить инвентаризацию?</b>",
+        HR,
+        "всего лотов     " + str(total),
+        "✅ на месте     " + str(ok),
+        "❌ отсутствует  " + str(miss),
+    ]
+    if unmarked > 0:
+        rows.append("⬜ не отмечено   " + str(unmarked) + " — посчитаю отсутствующими")
+    ui(
+        chat_id,
+        "\n".join(rows),
+        kb(
+            [
+                [btn("✓  записать и завершить", "iv:go")],
+                [btn("‹ к списку", "iv:cats")],
+                [btn("🚪 отменить инвентаризацию", "iv:cxo")],
+            ]
+        ),
+    )
+
+
+def inv_finish_confirm(chat_id, force=False):
+    inv = inv_state()
+    if not inv:
+        go_menu(chat_id, "инвентаризация уже не идёт.")
+        return
+    if inv.get("by") != chat_id:
+        inv_foreign(chat_id, inv)
+        return
+    total, ok, miss = inv_counts(inv)
+    marks = inv.get("marks") or {}
+    unmarked = total - ok - miss
+    items = []
+    for it in inv.get("items") or []:
+        m = marks.get(str(it.get("row")))
+        if m == INV_OK:
+            status = INV_SHEET_OK
+        elif m == INV_MISS:
+            status = INV_SHEET_MISS
+        else:
+            status = INV_SHEET_UNMARKED
+        items.append(
+            {
+                "sheet_row": int(it.get("row") or 0),
+                "product": str(it.get("product") or ""),
+                "buy": str(it.get("buy") or ""),
+                "cost": int(it.get("cost") or 0),
+                "status": status,
+            }
+        )
+    period = period_str()
+    saved = False
+    if not force:
+        r = sheets_call(
+            {
+                "action": "inv_save",
+                "session_id": inv.get("session_id") or 0,
+                "date": today_str(),
+                "period": period,
+                "who": inv.get("by_name") or "",
+                "counts": {"total": total, "ok": ok, "miss": miss + unmarked},
+                "items": items,
+            }
+        )
+        if r.get("ok") and (r.get("wrote") is not None or r.get("session_id")):
+            saved = True
+        if not saved:
+            ui(
+                chat_id,
+                "таблица не ответила, ничего не записал.\nинвентаризация продолжает идти.",
+                kb(
+                    [
+                        [btn("↻ повторить", "iv:go")],
+                        [btn("закончить без записи", "iv:drop")],
+                        [btn("‹ к списку", "iv:cats")],
+                    ]
+                ),
+            )
+            return
+    SESSIONS.pop(INV_KEY, None)
+    persist_sess()
+    rows = [
+        "🏁 <b>Инвентаризация записана</b>",
+        HR,
+        "период       " + period_label(period),
+        "всего        " + str(total),
+        "✅ на месте  " + str(ok),
+        "❌ отсутствует  " + str(miss + unmarked),
+    ]
+    if saved:
+        rows.append("<i>записал в таблицу, лист «Инвентаризация».</i>")
+    else:
+        rows.append("<i>в таблицу не записывал — закончено без записи.</i>")
+    gone = [it for it in items if it["status"] != INV_SHEET_OK]
+    if gone:
+        rows.append("")
+        rows.append("<b>отсутствуют:</b>")
+        for it in gone[:15]:
+            rows.append("• " + esc(it["product"]) + " · " + fmt_money(it["cost"]))
+        if len(gone) > 15:
+            rows.append("<i>и ещё " + str(len(gone) - 15) + "</i>")
+    go_menu(chat_id, "\n".join(rows))
+
+
+def inv_cancel_ask(chat_id):
+    if not inv_guard(chat_id):
+        return
+    s = sess(chat_id)
+    s["step"] = "inv_cx"
+    persist_sess()
+    ui(
+        chat_id,
+        "🚪 отменить инвентаризацию?\nотметки пропадут, в журнале появится «отменена».",
+        kb([[btn("да, отменить", "iv:cxd")], [btn("‹ нет", "iv:cats")]]),
+    )
+
+
+def inv_cancel_do(chat_id):
+    inv = inv_state()
+    if not inv:
+        go_menu(chat_id, "инвентаризация уже не идёт.")
+        return
+    if inv.get("by") == chat_id and inv.get("session_id"):
+        sheets_call({"action": "inv_cancel", "session_id": inv.get("session_id")})
+    SESSIONS.pop(INV_KEY, None)
+    persist_sess()
+    go_menu(chat_id, "инвентаризация отменена, отметки сброшены.")
+
+
+def inv_history(chat_id):
+    s = sess(chat_id)
+    SESSIONS[sid(chat_id)] = {
+        "step": "inv_months",
+        "type": "inv",
+        "msg_id": s.get("msg_id"),
+    }
+    persist_sess()
+    ui(chat_id, "смотрю журнал…")
+    r = sheets_call({"action": "inv_list"}, attempts=1, deadline_s=12)
+    entries = r.get("entries") if r.get("ok") else None
+    if not isinstance(entries, list):
+        ui(
+            chat_id,
+            "журнал сейчас не открылся. попробуй ещё раз.",
+            kb([[btn("↻ ещё раз", "iv:hist")], [btn("‹ меню", "m:cancel")]]),
+        )
+        return
+    s = sess(chat_id)
+    s["inv_entries"] = entries
+    persist_sess()
+    done = {}
+    for e in entries:
+        status = str(e.get("status") or "")
+        if "завершена" not in status:
+            continue
+        p = str(e.get("period") or "")
+        if not p:
+            continue
+        prev = done.get(p)
+        if not prev or int(e.get("id") or 0) > int(prev.get("id") or 0):
+            done[p] = e
+    rows = []
+    inv = inv_state()
+    if inv:
+        total, ok, miss = inv_counts(inv)
+        rows.append([btn("🟡 идёт сейчас · %d/%d" % (ok + miss, total), "iv:home")])
+    for p in sorted(done, reverse=True):
+        e = done[p]
+        label = "%s · всего %s · ❌ %s" % (period_label(p), e.get("total") or "?", e.get("miss") or "?")
+        rows.append([btn(label[:60], "iv:h:%s" % e.get("id"))])
+    if not rows:
+        rows.append([btn("завершённых пока нет", "iv:none")])
+    rows.append([btn("‹ меню", "m:cancel")])
+    ui(
+        chat_id,
+        "<b>Инвентаризации по месяцам</b>\n\n<i>просмотр за месяц. отсутствующие можно поправить.</i>",
+        kb(rows),
+    )
+
+
+def inv_month_view(chat_id, session_id: int, page=0, refresh=False):
+    s = sess(chat_id)
+    items = s.get("inv_items") or []
+    if refresh or not items or s.get("inv_sid") != session_id:
+        ui(chat_id, "смотрю журнал…")
+        got = fetch_inv_get(session_id)
+        if got is None:
+            ui(chat_id, "таблица не отвечает.")
+            return
+        items = got
+    s["step"] = "inv_month"
+    s["inv_sid"] = session_id
+    s["inv_items"] = items
+    entry = None
+    for e in s.get("inv_entries") or []:
+        if int(e.get("id") or 0) == session_id:
+            entry = e
+            break
+    if entry is None:
+        entries = fetch_inv_list() or []
+        s["inv_entries"] = entries
+        for e in entries:
+            if int(e.get("id") or 0) == session_id:
+                entry = e
+                break
+    missing = [it for it in items if str(it.get("status") or "").startswith("❌")]
+    okc = len(items) - len(missing)
+    head = [
+        "<b>" + period_label(str((entry or {}).get("period") or "")) + "</b>",
+        HR,
+    ]
+    if entry:
+        if entry.get("date"):
+            head.append(line("Дата", str(entry.get("date"))))
+        if entry.get("who"):
+            head.append(line("Проводил", esc(str(entry.get("who")))))
+    head.append(line("Всего", str(len(items))))
+    head.append(line("На месте", str(okc)))
+    head.append(line("Отсутствует", str(len(missing))))
+    head.append("")
+    head.append("<i>отсутствующие — тапни, чтобы поправить</i>")
+    rows = []
+    if missing:
+        page = max(0, page)
+        max_page = max(0, (len(missing) - 1) // PAGE)
+        if page > max_page:
+            page = max_page
+        s["inv_page"] = page
+        for it in missing[page * PAGE : (page + 1) * PAGE]:
+            label = ("%s · %s" % (str(it.get("product") or "?"), fmt_money(it.get("cost") or 0)))[:60]
+            rows.append([btn(label, "iv:fix:%s:%s" % (session_id, it.get("sheet_row")))])
+        nav = []
+        if page > 0:
+            nav.append(btn("‹", "iv:mp:%s:%d" % (session_id, page - 1)))
+        nav.append(btn("%d / %d" % (page + 1, max_page + 1), "iv:mp:%s:%d" % (session_id, page)))
+        if page < max_page:
+            nav.append(btn("›", "iv:mp:%s:%d" % (session_id, page + 1)))
+        rows.append(nav)
+    else:
+        s["inv_page"] = 0
+        rows.append([btn("всё на месте", "iv:none")])
+    rows.append([btn("‹ к месяцам", "iv:hist")])
+    persist_sess()
+    ui(chat_id, "\n".join(head), kb(rows))
+
+
+def inv_fix_card(chat_id, session_id: int, sheet_row: int):
+    s = sess(chat_id)
+    it = None
+    for x in s.get("inv_items") or []:
+        if int(x.get("sheet_row") or 0) == sheet_row:
+            it = x
+            break
+    if it is None:
+        items = fetch_inv_get(session_id) or []
+        s["inv_items"] = items
+        persist_sess()
+        for x in items:
+            if int(x.get("sheet_row") or 0) == sheet_row:
+                it = x
+                break
+    if it is None:
+        ui(chat_id, "не нашёл этот лот в журнале.")
+        return
+    s["step"] = "inv_fix"
+    s["inv_fix_row"] = sheet_row
+    persist_sess()
+    rows = [
+        "📦 <b>" + esc(str(it.get("product") or "?")) + "</b>",
+        HR,
+        line("Закуп", fmt_money(it.get("cost") or 0)),
+        line("Было", esc(str(it.get("status") or ""))),
+    ]
+    if it.get("fixed"):
+        rows.append(line("Правка", esc(str(it.get("fixed")))))
+    rows.append("")
+    rows.append("что теперь?")
+    ui(
+        chat_id,
+        "\n".join(rows),
+        kb(
+            [
+                [btn("✅ на месте", "iv:fx:%s:%s:ok" % (session_id, sheet_row))],
+                [btn("❌ отсутствует", "iv:fx:%s:%s:no" % (session_id, sheet_row))],
+                [btn("‹ назад", "iv:h:%s" % session_id)],
+            ]
+        ),
+    )
+
+
+def inv_fix_apply(chat_id, session_id: int, sheet_row: int, mark: str):
+    status = INV_SHEET_OK if mark == "ok" else INV_SHEET_MISS
+    r = sheets_call(
+        {
+            "action": "inv_update",
+            "session_id": session_id,
+            "sheet_row": sheet_row,
+            "status": status,
+            "fixed": today_str() + " · " + user_name(chat_id),
+        }
+    )
+    if not r.get("ok") or not r.get("row"):
+        ui(chat_id, "таблица не ответила, правка не записалась.")
+        return
+    s = sess(chat_id)
+    for x in s.get("inv_items") or []:
+        if int(x.get("sheet_row") or 0) == sheet_row:
+            x["status"] = status
+            x["fixed"] = today_str()
+    persist_sess()
+    inv_month_view(chat_id, session_id, s.get("inv_page") or 0, refresh=True)
+
+
+def on_inv_callback(chat_id, data):
+    s = sess(chat_id)
+    if data == "iv:begin":
+        inv_begin(chat_id)
+        return
+    if data == "iv:hist":
+        inv_history(chat_id)
+        return
+    if data == "iv:home":
+        inv = inv_state()
+        if not inv:
+            start_inventory(chat_id)
+        elif inv.get("by") == chat_id:
+            inv_home(chat_id)
+        else:
+            inv_foreign(chat_id, inv)
+        return
+    if data == "iv:cats":
+        if inv_guard(chat_id):
+            inv_categories(chat_id)
+        return
+    if data == "iv:back":
+        inv_list(chat_id, s.get("page") or 0)
+        return
+    if data == "iv:srch":
+        inv_ask_search(chat_id)
+        return
+    if data == "iv:fin":
+        inv_finish(chat_id)
+        return
+    if data == "iv:go":
+        inv_finish_confirm(chat_id)
+        return
+    if data == "iv:drop":
+        inv_finish_confirm(chat_id, force=True)
+        return
+    if data == "iv:cxo":
+        inv_cancel_ask(chat_id)
+        return
+    if data == "iv:cxd":
+        inv_cancel_do(chat_id)
+        return
+    if data == "iv:none":
+        return
+    if data.startswith("iv:c:"):
+        cat = data.split(":", 2)[2]
+        s["filter_cat"] = cat
+        s["query"] = ""
+        persist_sess()
+        inv_list(chat_id, 0)
+        return
+    if data.startswith("iv:pg:"):
+        try:
+            page = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            page = 0
+        inv_list(chat_id, max(0, page))
+        return
+    if data.startswith("iv:it:"):
+        try:
+            row = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            return
+        inv_item(chat_id, row)
+        return
+    if data.startswith("iv:ok:"):
+        try:
+            row = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            return
+        inv_mark(chat_id, row, INV_OK)
+        return
+    if data.startswith("iv:no:"):
+        try:
+            row = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            return
+        inv_mark(chat_id, row, INV_MISS)
+        return
+    if data.startswith("iv:fix:"):
+        parts = data.split(":")
+        if len(parts) < 4:
+            return
+        try:
+            inv_fix_card(chat_id, int(parts[2]), int(parts[3]))
+        except ValueError:
+            return
+        return
+    if data.startswith("iv:fx:"):
+        parts = data.split(":")
+        if len(parts) < 5:
+            return
+        try:
+            inv_fix_apply(chat_id, int(parts[2]), int(parts[3]), parts[4])
+        except ValueError:
+            return
+        return
+    if data.startswith("iv:mp:"):
+        parts = data.split(":")
+        if len(parts) < 4:
+            return
+        try:
+            inv_month_view(chat_id, int(parts[2]), max(0, int(parts[3])))
+        except ValueError:
+            return
+        return
+    if data.startswith("iv:h:"):
+        try:
+            session_id = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            return
+        inv_month_view(chat_id, session_id, refresh=True)
+        return
 
 
 def on_callback(chat_id, cb_id, data: str, message_id=None):
@@ -2058,6 +3284,15 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
     if data == "m:new":
         start_deal(chat_id)
         return
+    if data == "m:buy":
+        start_deal(chat_id, "buy")
+        return
+    if data == "m:sell":
+        start_deal(chat_id, "sell")
+        return
+    if data == "m:inv":
+        start_inventory(chat_id)
+        return
     if data == "m:cash":
         start_cash(chat_id)
         return
@@ -2070,11 +3305,35 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
     if data == "m:undo":
         start_undo(chat_id)
         return
+    if data.startswith("iv:"):
+        on_inv_callback(chat_id, data)
+        return
     if data == "un:no":
         go_menu(chat_id, "ок, оставил как было.")
         return
     if data == "un:yes":
         perform_undo(chat_id)
+        return
+    if data == "un:list":
+        show_undo_list(chat_id, sess(chat_id).get("undo_page") or 0)
+        return
+    if data == "un:last":
+        start_undo(chat_id)
+        return
+    if data.startswith("un:pg:"):
+        try:
+            page = int(data.split(":")[-1])
+        except ValueError:
+            page = 0
+        show_undo_list(chat_id, page)
+        return
+    if data.startswith("un:i:"):
+        try:
+            idx = int(data.split(":")[-1])
+        except ValueError:
+            show_undo_list(chat_id, 0)
+            return
+        confirm_undo_pick(chat_id, idx)
         return
     if data == "m:cats":
         if s.get("type") == "edit":
@@ -2086,6 +3345,9 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
             show_categories(chat_id, for_sell=True)
         return
     if data == "m:search":
+        if s.get("type") == "sell" and not s.get("unsold"):
+            if not load_unsold_or_fail(chat_id):
+                return
         ask_search(chat_id)
         return
     if data.startswith("k:"):
@@ -2116,6 +3378,9 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
             else:
                 ui(chat_id, "не смог записать категорию.")
             return
+        if s.get("type") == "sell" and not s.get("unsold"):
+            if not load_unsold_or_fail(chat_id):
+                return
         s["filter_cat"] = cat
         s["query"] = s.get("query") or ""
         persist_sess()
@@ -2190,7 +3455,7 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
                 s["edit_field"] = "role"
                 s["step"] = "edit_role"
                 persist_sess()
-                ui(chat_id, "напиши роль Матвея.", kb([nav_row()]), force_new=True)
+                ui(chat_id, "напиши роль Матвея.", kb([nav_row()]))
                 return
             if code == "skip":
                 r = sheets_call({"action": "update", "sheet_row": s.get("edit_row"), "fields": {"role": ""}})
@@ -2212,7 +3477,7 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
         if code == "other":
             s["step"] = "role_other"
             persist_sess()
-            ui(chat_id, "напиши роль Матвея своими словами.", kb([nav_row()]), force_new=True)
+            ui(chat_id, "напиши роль Матвея своими словами.", kb([nav_row()]))
             return
         if code == "skip":
             s["role"] = ""
@@ -2239,7 +3504,7 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
                 s["edit_field"] = "place"
                 s["step"] = "edit_place"
                 persist_sess()
-                ui(chat_id, "напиши где продали.", kb([nav_row()]), force_new=True)
+                ui(chat_id, "напиши где продали.", kb([nav_row()]))
                 return
             name = PLACE_MAP.get(code, code)
             r = sheets_call(
@@ -2253,7 +3518,7 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
         if code == "other":
             s["step"] = "place_other"
             persist_sess()
-            ui(chat_id, "напиши где продали.", kb([nav_row()]), force_new=True)
+            ui(chat_id, "напиши где продали.", kb([nav_row()]))
             return
         s["place"] = PLACE_MAP.get(code, code)
         persist_sess()
@@ -2342,13 +3607,13 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
             s["edit_field"] = "delivery"
             s["step"] = "edit_deliv"
             persist_sess()
-            ui(chat_id, "сумма доставки, только число. 0 если нет.", kb([nav_row()]), force_new=True)
+            ui(chat_id, "сумма доставки, только число. 0 если нет.", kb([nav_row()]))
             return
         if field == "cons":
             s["edit_field"] = "consumable"
             s["step"] = "edit_cons"
             persist_sess()
-            ui(chat_id, "сумма расходников, только число. 0 если нет.", kb([nav_row()]), force_new=True)
+            ui(chat_id, "сумма расходников, только число. 0 если нет.", kb([nav_row()]))
             return
         prompts = {
             "cost": "новая цена закупа, только число.",
@@ -2367,7 +3632,7 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
         s["step"] = step_map.get(field, "edit_note")
         persist_sess()
         extra = skip_note_kb() if field == "note" else kb([nav_row()])
-        ui(chat_id, prompts.get(field, "напиши новое значение."), extra, force_new=True)
+        ui(chat_id, prompts.get(field, "напиши новое значение."), extra)
         return
     if data == "xd:no":
         s["edit_field"] = None
@@ -2411,7 +3676,7 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
             _CASH["t"] = 0
             go_menu(chat_id, "лот удалил из таблицы." + extra)
         else:
-            ui(chat_id, "не смог удалить.", force_new=True)
+            ui(chat_id, "не смог удалить.")
             go_menu(chat_id)
         return
     if data == "ok":
@@ -2445,6 +3710,7 @@ def handle_update(u: dict):
             answer_cb(cb_id)
         send(chat_id, "нет доступа.")
         return
+    remember_user(chat_id, u)
     if "message" in u:
         m = u["message"]
         if "text" in m:
@@ -2466,13 +3732,13 @@ def setup_bot():
                 {"command": "start", "description": "Меню"},
                 {"command": "edit", "description": "Изменить лот"},
                 {"command": "balance", "description": "Касса, сколько на руках"},
+                {"command": "inv", "description": "Инвентаризация"},
                 {"command": "undo", "description": "Отменить последнее действие"},
                 {"command": "cancel", "description": "Отменить ввод"},
             ]
         },
     )
-    r = sheets_call({"action": "setup"})
-    log("sheets setup " + str(r.get("ok")) + " hand=" + str(r.get("hand")))
+    log("sheets setup deferred to keepwarm")
 
 
 def loop():
@@ -2488,6 +3754,7 @@ def loop():
         + " started allowed="
         + ",".join(str(x) for x in sorted(ALLOWED_CHAT_IDS))
     )
+    threading.Thread(target=_sheets_keepwarm, name="sheets-warm", daemon=True).start()
     offset = 0
     while True:
         res = api(

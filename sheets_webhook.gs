@@ -1,8 +1,7 @@
 /**
  * Вебхук бота учёта → листы Касса и Продажи.
  *
- * Перед деплоем вставь свой id таблицы и секрет.
- * Либо: Проект → Настройки проекта → Свойства скрипта:
+ * Перед деплоем: Проект → Настройки проекта → Свойства скрипта:
  *   SHEET_ID, WEBHOOK_SECRET
  *
  * Развернуть → Веб-приложение:
@@ -23,44 +22,85 @@ var COL_BUYER = 18;    // R Контакт
 var COL_CAT = 20;      // T Категория
 var COL_NOTE = 21;     // U Примечание
 
+function cache_() {
+  return CacheService.getScriptCache();
+}
+
+function cacheGet_(key) {
+  try {
+    var hit = cache_().get(key);
+    if (hit) return ContentService.createTextOutput(hit).setMimeType(ContentService.MimeType.JSON);
+  } catch (e) {}
+  return null;
+}
+
+function cachePut_(key, obj) {
+  try { cache_().put(key, JSON.stringify(obj), 20); } catch (e) {}
+  return json_(obj);
+}
+
+function cacheDrop_() {
+  try {
+    cache_().removeAll(['balance', 'setup', 'unsold', 'lots', 'inv_list']);
+  } catch (e) {}
+}
+
 function doPost(e) {
   var body = {};
   try { body = JSON.parse((e && e.postData && e.postData.contents) || '{}'); }
   catch (err) { return json_({ok: false, error: 'bad json'}); }
   if (body.secret !== WEBHOOK_SECRET) return json_({ok: false, error: 'forbidden'});
 
+  var action = body.action || 'write';
+  if (action === 'ping') return json_({ok: true, pong: true});
+
+  if (action === 'balance') {
+    var c0 = cacheGet_('balance');
+    if (c0) return c0;
+  }
+  if (action === 'setup') {
+    var c1 = cacheGet_('setup');
+    if (c1) return c1;
+  }
+  if (action === 'unsold') {
+    var c2 = cacheGet_('unsold');
+    if (c2) return c2;
+  }
+  if (action === 'inv_list') {
+    var c3 = cacheGet_('inv_list');
+    if (c3) return c3;
+  }
+
   var ss = SpreadsheetApp.getActive() || SpreadsheetApp.openById(SHEET_ID);
   var sales = ss.getSheetByName('Продажи');
   var kassa = ss.getSheetByName('Касса');
-  var action = body.action || 'write';
+  var writing = (
+    action === 'update' || action === 'delete' || action === 'inv_start' ||
+    action === 'inv_save' || action === 'inv_cancel' || action === 'inv_update' ||
+    action === 'write' || body.cash_dir || body.type === 'buy' || body.type === 'sell'
+  );
+  if (sales && (writing || action === 'setup')) ensureExtraCols_(sales);
 
-  if (sales) ensureExtraCols_(sales);
-
-  if (action === 'ping') return json_({ok: true, pong: true});
-  if (action === 'balance') return json_(readBalance_(ss, kassa));
+  if (action === 'balance') return cachePut_('balance', readBalance_(ss, kassa));
   if (action === 'setup') {
-    if (sales) fillCats_(sales);
+    maybeFillCats_(sales);
     var b = readBalance_(ss, kassa);
     b.setup = true;
-    return json_(b);
+    return cachePut_('setup', b);
   }
   if (action === 'unsold') {
-    if (sales) fillCats_(sales);
-    var u = readBalance_(ss, kassa);
-    u.items = listUnsold_(sales);
-    return json_(u);
+    return cachePut_('unsold', {ok: true, items: listUnsold_(sales)});
   }
   if (action === 'lots') {
-    if (sales) fillCats_(sales);
-    var L = readBalance_(ss, kassa);
-    L.items = listLots_(sales, body);
-    return json_(L);
+    if (sales) maybeFillCats_(sales);
+    return json_({ok: true, items: listLots_(sales, body)});
   }
   if (action === 'lot') {
     return json_({ok: true, item: getLot_(sales, Number(body.sheet_row || body.row || 0))});
   }
   if (action === 'update') {
     updateLot_(sales, body);
+    cacheDrop_();
     return json_({ok: true});
   }
   if (action === 'delete') {
@@ -71,8 +111,15 @@ function doPost(e) {
     }
     var rev = reverseKassa_(kassa, item);
     deleteLot_(sales, rowDel);
+    cacheDrop_();
     return json_({ok: true, reversed: rev});
   }
+  if (action === 'inv_start') { cacheDrop_(); return json_(invStart_(ss, body)); }
+  if (action === 'inv_save') { cacheDrop_(); return json_(invSave_(ss, body)); }
+  if (action === 'inv_cancel') { cacheDrop_(); return json_(invCancel_(ss, body)); }
+  if (action === 'inv_list') return cachePut_('inv_list', {ok: true, entries: invList_(ss)});
+  if (action === 'inv_get') return json_({ok: true, items: invGet_(ss, Number(body.session_id || 0))});
+  if (action === 'inv_update') { cacheDrop_(); return json_(invUpdate_(ss, body)); }
 
   if (body.cash_dir === 'in' || body.cash_dir === 'out') {
     appendKassa_(kassa, body);
@@ -84,6 +131,7 @@ function doPost(e) {
   if (body.type === 'sell') {
     markSold_(sales, body);
   }
+  cacheDrop_();
   return json_({ok: true, sheet_row: written});
 }
 
@@ -117,11 +165,22 @@ function monthName_(d) {
 }
 
 function nextRow_(sh, col, start) {
-  var n = sh.getMaxRows();
-  var vals = sh.getRange(start, col, n - start + 1, 1).getValues();
+  var max = sh.getMaxRows();
   var last = start - 1;
-  for (var i = 0; i < vals.length; i++) {
-    if (vals[i][0] !== '' && vals[i][0] != null) last = start + i;
+  var from = start;
+  var chunk = 250;
+  while (from <= max) {
+    var n = Math.min(chunk, max - from + 1);
+    var vals = sh.getRange(from, col, n, 1).getValues();
+    var empty = true;
+    for (var i = 0; i < vals.length; i++) {
+      if (vals[i][0] !== '' && vals[i][0] != null) {
+        last = from + i;
+        empty = false;
+      }
+    }
+    if (empty && from > start) break;
+    from += chunk;
   }
   return last + 1;
 }
@@ -132,20 +191,37 @@ function lastDataRow_(sh) {
 
 function ensureExtraCols_(sh) {
   if (!sh) return;
+  try {
+    if (cache_().get('colsOk') === '1') return;
+  } catch (e0) {}
   var need = 21;
   if (sh.getMaxColumns() < need) {
     sh.insertColumnsAfter(sh.getMaxColumns(), need - sh.getMaxColumns());
   }
-  try { sh.showColumns(COL_CAT, 2); } catch (e1) {}
-  sh.setColumnWidth(COL_CAT, 140);
-  sh.setColumnWidth(COL_NOTE, 220);
-  sh.getRange(8, COL_CAT).setValue('Категория');
-  sh.getRange(8, COL_NOTE).setValue('Примечание');
-  try {
-    sh.getRange(8, 17).copyFormatToRange(sh, COL_CAT, COL_NOTE, 8, 8);
-  } catch (e2) {
-    try { sh.getRange(8, 5).copyFormatToRange(sh, COL_CAT, COL_NOTE, 8, 8); } catch (e3) {}
+  var headCat = sh.getRange(8, COL_CAT).getValue();
+  var headNote = sh.getRange(8, COL_NOTE).getValue();
+  if (headCat !== 'Категория' || headNote !== 'Примечание') {
+    try { sh.showColumns(COL_CAT, 2); } catch (e1) {}
+    sh.setColumnWidth(COL_CAT, 140);
+    sh.setColumnWidth(COL_NOTE, 220);
+    sh.getRange(8, COL_CAT).setValue('Категория');
+    sh.getRange(8, COL_NOTE).setValue('Примечание');
+    try {
+      sh.getRange(8, 17).copyFormatToRange(sh, COL_CAT, COL_NOTE, 8, 8);
+    } catch (e2) {
+      try { sh.getRange(8, 5).copyFormatToRange(sh, COL_CAT, COL_NOTE, 8, 8); } catch (e3) {}
+    }
   }
+  try { cache_().put('colsOk', '1', 21600); } catch (e4) {}
+}
+
+function maybeFillCats_(sh) {
+  if (!sh) return;
+  try {
+    if (cache_().get('catsOk') === '1') return;
+  } catch (e0) {}
+  fillCats_(sh);
+  try { cache_().put('catsOk', '1', 21600); } catch (e1) {}
 }
 
 function guessCategory_(name) {
@@ -452,4 +528,169 @@ function deleteLot_(sh, row) {
   for (var i = 0; i < clearCols.length; i++) {
     sh.getRange(row, clearCols[i]).clearContent();
   }
+}
+
+/* ===== Инвентаризация =====
+   Журнал: A дата · B период MM.YYYY · C кто · D всего · E на месте · F отсутствует · G статус
+   Результаты: J сессия(строка журнала) · K дата · L период · M товар · N дата закупа ·
+               O закуп ₽ · P строка в Продажах · Q статус · R правка */
+
+var INV_NAME = 'Инвентаризация';
+var INV_C_GO = '#d9ead3';   // зелёный — на месте
+var INV_C_MISS = '#f4cccc'; // красный — отсутствует
+var INV_C_WAIT = '#fff2cc'; // жёлтый — идёт
+var INV_C_OFF = '#efefef';  // серый — отменена
+
+function ensureInvSheet_(ss) {
+  if (!ss) return null;
+  var sh = ss.getSheetByName(INV_NAME);
+  var created = false;
+  if (!sh) {
+    sh = ss.insertSheet(INV_NAME);
+    created = true;
+  }
+  try {
+    if (!created && cache_().get('invHead') === '1') return sh;
+  } catch (e0) {}
+  if (sh.getMaxColumns() < 18) sh.insertColumnsAfter(sh.getMaxColumns(), 18 - sh.getMaxColumns());
+  var head1 = ['Дата', 'Период', 'Кто', 'Всего', 'На месте', 'Отсутствует', 'Статус'];
+  var head2 = ['Сессия', 'Дата', 'Месяц', 'Товар', 'Дата закупа', 'Закуп ₽', 'Строка', 'Статус', 'Правка'];
+  sh.getRange(8, 1, 1, head1.length).setValues([head1]).setFontWeight('bold');
+  sh.getRange(8, 10, 1, head2.length).setValues([head2]).setFontWeight('bold');
+  sh.setColumnWidth(3, 120);
+  sh.setColumnWidth(7, 110);
+  sh.setColumnWidth(13, 240);
+  sh.setColumnWidth(17, 150);
+  sh.setColumnWidth(18, 140);
+  try { cache_().put('invHead', '1', 21600); } catch (e1) {}
+  return sh;
+}
+
+function invStart_(ss, b) {
+  var sh = ensureInvSheet_(ss);
+  if (!sh) return {ok: false, error: 'no sheet'};
+  var row = nextRow_(sh, 1, 9);
+  sh.getRange(row, 1).setValue(new Date()).setNumberFormat('dd.mm.yyyy');
+  sh.getRange(row, 3).setValue(String(b.who || ''));
+  sh.getRange(row, 7).setValue('🟡 идёт').setBackground(INV_C_WAIT);
+  return {ok: true, session_id: row};
+}
+
+function invSave_(ss, b) {
+  var sh = ensureInvSheet_(ss);
+  if (!sh) return {ok: false, error: 'no sheet'};
+  var id = Number(b.session_id || 0);
+  if (!id || id < 9) id = nextRow_(sh, 1, 9);
+  var c = b.counts || {};
+  var d = parseDate_(b.date) || new Date();
+  sh.getRange(id, 1).setValue(d).setNumberFormat('dd.mm.yyyy');
+  sh.getRange(id, 2).setValue(String(b.period || ''));
+  sh.getRange(id, 3).setValue(String(b.who || ''));
+  sh.getRange(id, 4).setValue(Number(c.total || 0));
+  sh.getRange(id, 5).setValue(Number(c.ok || 0));
+  sh.getRange(id, 6).setValue(Number(c.miss || 0));
+  sh.getRange(id, 7).setValue('🟢 завершена').setBackground(INV_C_GO);
+  var items = b.items || [];
+  var wrote = 0;
+  if (items.length) {
+    var out = [];
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      var st = String(it.status || '');
+      out.push([
+        id,
+        d,
+        String(b.period || ''),
+        String(it.product || ''),
+        parseDate_(it.buy) || '',
+        Number(it.cost || 0),
+        Number(it.sheet_row || 0),
+        st,
+        ''
+      ]);
+    }
+    var r0 = nextRow_(sh, 10, 9);
+    sh.getRange(r0, 10, out.length, 9).setValues(out);
+    sh.getRange(r0, 11, out.length, 1).setNumberFormat('dd.mm.yyyy');
+    for (var j = 0; j < out.length; j++) {
+      var isOk = out[j][7].indexOf('✅') === 0;
+      sh.getRange(r0 + j, 17).setBackground(isOk ? INV_C_GO : INV_C_MISS);
+    }
+    wrote = out.length;
+  }
+  return {ok: true, session_id: id, wrote: wrote};
+}
+
+function invCancel_(ss, b) {
+  var sh = ensureInvSheet_(ss);
+  if (!sh) return {ok: false, error: 'no sheet'};
+  var id = Number(b.session_id || 0);
+  if (id >= 9) {
+    sh.getRange(id, 7).setValue('⚪ отменена').setBackground(INV_C_OFF);
+  }
+  return {ok: true};
+}
+
+function invList_(ss) {
+  var sh = ensureInvSheet_(ss);
+  if (!sh) return [];
+  var last = nextRow_(sh, 1, 9) - 1;
+  if (last < 9) return [];
+  var vals = sh.getRange(9, 1, last - 8, 7).getValues();
+  var out = [];
+  for (var i = 0; i < vals.length; i++) {
+    if (vals[i][0] === '' && vals[i][0] == null && !vals[i][6]) continue;
+    out.push({
+      id: 9 + i,
+      date: formatDate_(vals[i][0]),
+      period: String(vals[i][1] || ''),
+      who: String(vals[i][2] || ''),
+      total: num_(vals[i][3]),
+      ok: num_(vals[i][4]),
+      miss: num_(vals[i][5]),
+      status: String(vals[i][6] || '')
+    });
+  }
+  return out.reverse();
+}
+
+function invGet_(ss, id) {
+  var sh = ensureInvSheet_(ss);
+  if (!sh || !id || id < 9) return [];
+  var last = nextRow_(sh, 10, 9) - 1;
+  if (last < 9) return [];
+  var vals = sh.getRange(9, 10, last - 8, 9).getValues();
+  var out = [];
+  for (var i = 0; i < vals.length; i++) {
+    if (Number(vals[i][0]) !== Number(id)) continue;
+    out.push({
+      product: String(vals[i][3] || ''),
+      buy: formatDate_(vals[i][4]),
+      cost: num_(vals[i][5]),
+      sheet_row: num_(vals[i][6]),
+      status: String(vals[i][7] || ''),
+      fixed: String(vals[i][8] || '')
+    });
+  }
+  return out;
+}
+
+function invUpdate_(ss, b) {
+  var sh = ensureInvSheet_(ss);
+  if (!sh) return {ok: false, error: 'no sheet'};
+  var id = Number(b.session_id || 0);
+  var rowLot = Number(b.sheet_row || 0);
+  var last = nextRow_(sh, 10, 9) - 1;
+  if (last < 9 || !id || !rowLot) return {ok: false, error: 'not found'};
+  var vals = sh.getRange(9, 10, last - 8, 7).getValues();
+  for (var i = 0; i < vals.length; i++) {
+    if (Number(vals[i][0]) === id && Number(vals[i][6]) === rowLot) {
+      var r = 9 + i;
+      var st = String(b.status || '');
+      sh.getRange(r, 17).setValue(st).setBackground(st.indexOf('✅') === 0 ? INV_C_GO : INV_C_MISS);
+      sh.getRange(r, 18).setValue(String(b.fixed || ''));
+      return {ok: true, row: r};
+    }
+  }
+  return {ok: false, error: 'not found'};
 }
