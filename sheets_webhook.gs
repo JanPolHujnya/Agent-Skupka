@@ -1,17 +1,9 @@
 /**
- * Вебхук бота учёта → листы Касса и Продажи.
- *
- * Перед деплоем: Проект → Настройки проекта → Свойства скрипта:
- *   SHEET_ID, WEBHOOK_SECRET
- *
- * Развернуть → Веб-приложение:
- *   выполнить от имени: я
- *   доступ: все
+ * Вебхук @uchetskup_bot → Касса и Продажи.
+ * Развернуть → Веб-приложение, доступ: Все.
  */
-var SHEET_ID = PropertiesService.getScriptProperties().getProperty('SHEET_ID')
-  || 'YOUR_GOOGLE_SHEET_ID';
-var WEBHOOK_SECRET = PropertiesService.getScriptProperties().getProperty('WEBHOOK_SECRET')
-  || 'CHANGE_ME';
+var SHEET_ID = '1f1GSrlJp_MQGCMi6tBlRfEkvpfzQ7qyNLv-kYs0iP4E';
+var WEBHOOK_SECRET = 'motya-kassa-7f3c9e';
 var MONTHS = ['Января','Февраля','Марта','Апреля','Мая','Июня','Июля','Августа','Сентября','Октября','Ноября','Декабря'];
 var COL_DELIVERY = 7;  // G Доставка
 var COL_CONS = 8;      // H Расходник
@@ -120,6 +112,16 @@ function doPost(e) {
   if (action === 'inv_list') return cachePut_('inv_list', {ok: true, entries: invList_(ss)});
   if (action === 'inv_get') return json_({ok: true, items: invGet_(ss, Number(body.session_id || 0))});
   if (action === 'inv_update') { cacheDrop_(); return json_(invUpdate_(ss, body)); }
+  if (action === 'kassa_all') {
+    return json_({ok: true, rows: kassaRows_(kassa)});
+  }
+  if (action === 'kassa_del') {
+    var kd = Number(body.row || 0);
+    if (!kd || kd < 9) return json_({ok: false, error: 'bad row'});
+    kassa.deleteRow(kd);
+    cacheDrop_();
+    return json_({ok: true});
+  }
 
   if (body.cash_dir === 'in' || body.cash_dir === 'out') {
     appendKassa_(kassa, body);
@@ -406,11 +408,15 @@ function addNum_(sh, row, col, v) {
 }
 
 function writeRole_(sh, row, b) {
-  if (b.role) sh.getRange(row, COL_ROLE).setValue(b.role);
+  if (!b.role) return;
+  sh.getRange(row, COL_ROLE).setValue(b.role);
   if (b.role_pct !== '' && b.role_pct != null) {
     var p = Number(b.role_pct);
     if (p > 1) p = p / 100;
     sh.getRange(row, COL_PCT).setValue(p).setNumberFormat('0%');
+  } else {
+    // роль без процента: чистим L, чтобы не оставался % прошлой роли
+    sh.getRange(row, COL_PCT).clearContent();
   }
 }
 
@@ -477,11 +483,16 @@ function updateLot_(sh, b) {
   if (f.note != null) sh.getRange(row, COL_NOTE).setValue(f.note);
   if (f.delivery != null && f.delivery !== '') sh.getRange(row, COL_DELIVERY).setValue(Number(f.delivery));
   if (f.consumable != null && f.consumable !== '') sh.getRange(row, COL_CONS).setValue(Number(f.consumable));
-  if (f.role != null) sh.getRange(row, COL_ROLE).setValue(f.role);
-  if (f.role_pct != null && f.role_pct !== '') {
-    var p = Number(f.role_pct);
-    if (p > 1) p = p / 100;
-    sh.getRange(row, COL_PCT).setValue(p).setNumberFormat('0%');
+  if (f.role != null) {
+    sh.getRange(row, COL_ROLE).setValue(f.role);
+    if (f.role_pct != null && f.role_pct !== '') {
+      var p = Number(f.role_pct);
+      if (p > 1) p = p / 100;
+      sh.getRange(row, COL_PCT).setValue(p).setNumberFormat('0%');
+    } else {
+      // роль поменяли на вариант без процента — % тоже убираем
+      sh.getRange(row, COL_PCT).clearContent();
+    }
   }
 }
 
@@ -524,10 +535,30 @@ function reverseKassa_(kassa, item) {
 
 function deleteLot_(sh, row) {
   if (!sh || !row || row < 9) return;
-  var clearCols = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, COL_CAT, COL_PLACE, COL_BUYER, COL_NOTE];
+  var clearCols = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, COL_PCT, COL_CAT, COL_PLACE, COL_BUYER, COL_NOTE];
   for (var i = 0; i < clearCols.length; i++) {
     sh.getRange(row, clearCols[i]).clearContent();
   }
+}
+
+function kassaRows_(sh) {
+  if (!sh) return [];
+  var last = nextRow_(sh, 2, 9) - 1;
+  if (last < 9) return [];
+  var vals = sh.getRange(9, 1, last - 8, 5).getValues();
+  var out = [];
+  for (var i = 0; i < vals.length; i++) {
+    if (!vals[i][1] && !vals[i][2] && !vals[i][3]) continue;
+    out.push({
+      row: 9 + i,
+      date: formatDate_(vals[i][0]),
+      what: String(vals[i][1] || ''),
+      inn: num_(vals[i][2]),
+      out: num_(vals[i][3]),
+      comment: String(vals[i][4] || '')
+    });
+  }
+  return out;
 }
 
 /* ===== Инвентаризация =====
