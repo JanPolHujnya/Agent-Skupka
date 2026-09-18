@@ -553,16 +553,19 @@ def peek_balance() -> dict:
 def fetch_balance(force=False) -> dict:
     now = time.time()
     cached = _CASH.get("data")
-    if not force and cached and now - _CASH["t"] < 25:
-        return cached
-    if cached and not force:
-        return cached
-    r = sheets_call({"action": "balance"}, attempts=1, deadline_s=6)
+    if cached:
+        # локальная оценка (таблица не ответила) живёт 8 с и потом
+        # перепроверяется — лист мог ожить; кэш таблицы не стареет до записи
+        ttl = 8 if cached.get("source") == "local" else 25
+        if not force and now - _CASH["t"] < ttl:
+            return cached
+        if cached.get("source") != "local" and not force:
+            return cached
+    r = sheets_call({"action": "balance"}, attempts=2, deadline_s=15)
     if r.get("ok") and "hand" in r:
         ingest_cash(r)
         return _CASH["data"]
-    data = local_balance()
-    return remember_cash(data)
+    return remember_cash(local_balance())
 
 
 def cash_on_hand() -> int:
@@ -802,10 +805,11 @@ def _sheets_call_inner(url, payload, action, key, attempts, deadline_s) -> dict:
     secret = ENV.get("WEBHOOK_SECRET") or ""
     err = ""
     t_all = time.time()
-    # append/delete вслепую не повторяем: при таймауте строка уже могла
-    # записаться — повтор даёт дубль в таблице. Даём им большой дедлайн.
+    # append/delete вслепую не повторяем при таймауте: строка уже могла
+    # записаться — повтор даёт дубль в таблице. Но 404/обрыв соединения
+    # значит «запрос точно не дошёл» — такой повтор безопасен и нужен.
     if action in ("write", "delete"):
-        ntry = 1
+        ntry = 2
         deadline_s = max(float(deadline_s), 18)
     else:
         ntry = max(1, int(attempts))
@@ -827,6 +831,9 @@ def _sheets_call_inner(url, payload, action, key, attempts, deadline_s) -> dict:
                 data = None
             if not isinstance(data, dict):
                 err = "не json: " + text[:60]
+                if action in ("write", "delete"):
+                    # ответ получен, но непонятен: запись уже могла пройти
+                    break
                 continue
             if data.get("error") == "forbidden":
                 return data
@@ -838,6 +845,8 @@ def _sheets_call_inner(url, payload, action, key, attempts, deadline_s) -> dict:
             if poisoned:
                 err = "кэш отдал чужой ответ"
                 log("sheets %.1fs %s poisoned, retry" % (time.time() - t0, action))
+                if action in ("write", "delete"):
+                    break
                 continue
             if data.get("ok") and action in SHEETS_READ:
                 _sheets_cache[action] = (time.time(), data)
@@ -846,8 +855,15 @@ def _sheets_call_inner(url, payload, action, key, attempts, deadline_s) -> dict:
         except Exception as e:
             err = str(e)
             log("sheets fail %.1fs %s try%d: %s" % (time.time() - t0, action, attempt, e))
+            low = err.lower()
+            if action in ("write", "delete") and (
+                "timed out" in low or "timeout" in low
+                or "deadline" in low or "redirects" in low
+            ):
+                # google мог уже выполнить запись — вслепую не повторяем
+                break
             # 404/чужой кэш — сразу ещё раз. пауза только если google завис
-            if "timed out" in err.lower() or "timeout" in err.lower():
+            if "timed out" in low or "timeout" in low:
                 time.sleep(0.3)
             continue
     log("sheets err %s after %.1fs: %s" % (action, time.time() - t_all, err[:120]))
@@ -941,7 +957,12 @@ def _unsold_refresh(block: bool = False, priority: str = "user") -> None:
 
     def worker():
         try:
-            r = sheets_call({"action": "unsold"}, attempts=1, deadline_s=8, priority=priority)
+            r = sheets_call(
+                {"action": "unsold"},
+                attempts=(1 if priority == "warm" else 2),
+                deadline_s=(5 if priority == "warm" else 15),
+                priority=priority,
+            )
             items = r.get("items") if r.get("ok") else None
             if isinstance(items, list):
                 _unsold_set(items)
@@ -1014,7 +1035,12 @@ def _lots_refresh(block: bool = False, priority: str = "user") -> None:
 
     def worker():
         try:
-            r = sheets_call({"action": "lots", "mode": "all"}, attempts=1, deadline_s=8, priority=priority)
+            r = sheets_call(
+                {"action": "lots", "mode": "all"},
+                attempts=(1 if priority == "warm" else 2),
+                deadline_s=(5 if priority == "warm" else 15),
+                priority=priority,
+            )
             items = r.get("items") if r.get("ok") else None
             if isinstance(items, list):
                 _lots_set(items)
