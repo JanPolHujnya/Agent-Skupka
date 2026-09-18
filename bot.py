@@ -40,6 +40,7 @@ DEALS_PATH = DATA / "deals.jsonl"
 STATE_PATH = DATA / "state.json"
 LOG_PATH = DATA / "bot.log"
 UNSOLD_PATH = DATA / "unsold_cache.json"
+LOTS_PATH = DATA / "lots_cache.json"
 
 API = "https://api.telegram.org/bot{token}/{method}"
 
@@ -79,17 +80,7 @@ HR = "────────"
 BUY_TOTAL = 10
 SELL_TOTAL = 11
 
-INV_KEY = "_inv"
 USERS_KEY = "_users"
-INV_OK = "ok"
-INV_MISS = "miss"
-INV_MONTHS = [
-    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
-]
-INV_SHEET_OK = "✅ на месте"
-INV_SHEET_MISS = "❌ отсутствует"
-INV_SHEET_UNMARKED = "❌ не отмечено"
 
 
 def load_env():
@@ -148,7 +139,17 @@ def log(msg: str) -> None:
         print(line.encode("utf-8", "replace").decode("ascii", "replace"), flush=True)
 
 
-def api(method: str, payload: dict | None = None, timeout: int = 35) -> dict:
+def bg(fn, *a, **k):
+    def wrap():
+        try:
+            fn(*a, **k)
+        except Exception:
+            log(traceback.format_exc())
+
+    threading.Thread(target=wrap, daemon=True, name="bg").start()
+
+
+def api(method: str, payload: dict | None = None, timeout: int = 12) -> dict:
     url = API.format(token=TOKEN, method=method)
     data = None
     headers = {}
@@ -182,7 +183,6 @@ def reply_kb():
             [{"text": "🛒 Закуп"}, {"text": "💸 Продажа"}],
             [{"text": "✏️ Лот"}, {"text": "💵 Деньги"}],
             [{"text": "💰 Касса"}, {"text": "Отменить последнее"}],
-            [{"text": "📋 Инвентаризация"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -198,7 +198,7 @@ def send(chat_id, text, markup=None):
     }
     if markup:
         payload["reply_markup"] = markup
-    return api("sendMessage", payload)
+    return api("sendMessage", payload, timeout=8)
 
 
 def edit_message(chat_id, message_id, text, markup=None):
@@ -211,11 +211,11 @@ def edit_message(chat_id, message_id, text, markup=None):
     }
     if markup:
         payload["reply_markup"] = markup
-    return api("editMessageText", payload)
+    return api("editMessageText", payload, timeout=4)
 
 
 def answer_cb(cb_id, text=""):
-    api("answerCallbackQuery", {"callback_query_id": cb_id, "text": text})
+    api("answerCallbackQuery", {"callback_query_id": cb_id, "text": text}, timeout=4)
 
 
 def cancel_row():
@@ -292,7 +292,7 @@ def progress_line(kind, step):
         total = 4
         title = "Деньги"
     else:
-        titles = {"edit": "Лот", "kind": "Сделка", "inv": "Инвентаризация"}
+        titles = {"edit": "Лот", "kind": "Сделка"}
         return "<b>" + esc(titles.get(kind, kind or "Учёт")) + "</b>"
     n, _name = mapping.get(step, (1, ""))
     return "<b>%s</b>\n%s" % (title, dots(n, total))
@@ -321,8 +321,16 @@ def save_json(path: Path, obj) -> None:
 
 
 SESSIONS: dict[str, dict] = load_json(STATE_PATH, {})
+_STATE_LOCK = threading.Lock()
 _CASH = {"t": 0.0, "data": None}
 _UNSOLD = {
+    "t": 0.0,
+    "items": None,
+    "lock": threading.Lock(),
+    "busy": False,
+    "done": threading.Event(),
+}
+_LOTS = {
     "t": 0.0,
     "items": None,
     "lock": threading.Lock(),
@@ -344,12 +352,14 @@ def sess(chat_id) -> dict:
 
 
 def clear_sess(chat_id):
-    SESSIONS[sid(chat_id)] = {"step": "idle"}
-    save_json(STATE_PATH, SESSIONS)
+    with _STATE_LOCK:
+        SESSIONS[sid(chat_id)] = {"step": "idle"}
+        save_json(STATE_PATH, SESSIONS)
 
 
 def persist_sess():
-    save_json(STATE_PATH, SESSIONS)
+    with _STATE_LOCK:
+        save_json(STATE_PATH, SESSIONS)
 
 
 def esc(s) -> str:
@@ -545,7 +555,9 @@ def fetch_balance(force=False) -> dict:
     cached = _CASH.get("data")
     if not force and cached and now - _CASH["t"] < 25:
         return cached
-    r = sheets_call({"action": "balance"})
+    if cached and not force:
+        return cached
+    r = sheets_call({"action": "balance"}, attempts=1, deadline_s=6)
     if r.get("ok") and "hand" in r:
         ingest_cash(r)
         return _CASH["data"]
@@ -554,7 +566,7 @@ def fetch_balance(force=False) -> dict:
 
 
 def cash_on_hand() -> int:
-    return int(fetch_balance().get("hand") or 0)
+    return int(peek_balance().get("hand") or 0)
 
 
 def append_deal(deal: dict) -> None:
@@ -668,23 +680,20 @@ def reverse_cash_row(orig: dict, what: str, direction: str) -> None:
 SHEETS_KEY = {
     "unsold": "items",
     "lots": "items",
-    "inv_list": "entries",
-    "inv_get": "items",
     "balance": "hand",
     "setup": "hand",
     "write": "sheet_row",
-    "inv_start": "session_id",
-    "inv_save": "session_id",
-    "inv_update": "row",
     "lot": "item",
 }
 SHEETS_FOREIGN = ("service", "hand", "items", "entries", "sheet_row", "item")
 
 # поход в таблицу стоит 2-9 с (скорость Apps Script), поэтому повторные
 # чтения в пределах 10 с берем из кэша. любое пишущее действие кэш сбрасывает
-SHEETS_READ = {"balance", "setup", "unsold", "lots", "lot", "inv_list", "inv_get"}
+SHEETS_READ = {"balance", "setup", "unsold", "lots", "lot"}
 SHEETS_CACHE_TTL = 10
 _sheets_cache: dict = {}
+_SHEETS_MU = threading.Lock()
+_SHEETS_USER = threading.Event()
 
 
 class SheetsRedirect(urllib.request.HTTPRedirectHandler):
@@ -757,7 +766,7 @@ def _sheets_http(url: str, data: bytes, deadline: float) -> str:
     raise TimeoutError("sheets redirects")
 
 
-def sheets_call(payload: dict, attempts: int = 2, deadline_s: float = 8) -> dict:
+def sheets_call(payload: dict, attempts: int = 2, deadline_s: float = 8, priority: str = "user") -> dict:
     url = ENV.get("SHEETS_WEBHOOK") or ""
     if not url:
         return {"ok": False, "error": "local"}
@@ -769,10 +778,37 @@ def sheets_call(payload: dict, attempts: int = 2, deadline_s: float = 8) -> dict
         hit = _sheets_cache.get(action)
         if hit and time.time() - hit[0] < SHEETS_CACHE_TTL:
             return hit[1]
+    if priority == "warm":
+        if _SHEETS_USER.is_set():
+            return {"ok": False, "error": "busy"}
+        got = _SHEETS_MU.acquire(timeout=0.05)
+        if not got:
+            return {"ok": False, "error": "busy"}
+        try:
+            if _SHEETS_USER.is_set():
+                return {"ok": False, "error": "busy"}
+            return _sheets_call_inner(url, payload, action, key, attempts, deadline_s)
+        finally:
+            _SHEETS_MU.release()
+    _SHEETS_USER.set()
+    try:
+        with _SHEETS_MU:
+            return _sheets_call_inner(url, payload, action, key, attempts, deadline_s)
+    finally:
+        _SHEETS_USER.clear()
+
+
+def _sheets_call_inner(url, payload, action, key, attempts, deadline_s) -> dict:
     secret = ENV.get("WEBHOOK_SECRET") or ""
     err = ""
     t_all = time.time()
-    ntry = max(1, int(attempts))
+    # append/delete вслепую не повторяем: при таймауте строка уже могла
+    # записаться — повтор даёт дубль в таблице. Даём им большой дедлайн.
+    if action in ("write", "delete"):
+        ntry = 1
+        deadline_s = max(float(deadline_s), 18)
+    else:
+        ntry = max(1, int(attempts))
     for attempt in range(1, ntry + 1):
         body = dict(payload)
         if secret:
@@ -819,16 +855,22 @@ def sheets_call(payload: dict, attempts: int = 2, deadline_s: float = 8) -> dict
 
 
 def _sheets_keepwarm():
-    # Apps Script остывает и первый POST идёт 10-15 с в 404/CDN.
-    time.sleep(1)
+    # не блокируем пользователя: короткий дедлайн, низкий приоритет, кэш с диска.
+    time.sleep(0.3)
     _unsold_from_disk()
+    _lots_from_disk()
     while True:
         try:
-            sheets_call({"action": "setup"}, attempts=1, deadline_s=8)
-            _unsold_refresh(block=True)
+            age_u = time.time() - (_UNSOLD.get("t") or 0)
+            age_l = time.time() - (_LOTS.get("t") or 0)
+            if _UNSOLD.get("items") is None or age_u > 90:
+                sheets_call({"action": "setup"}, attempts=1, deadline_s=5, priority="warm")
+                _unsold_refresh(block=False, priority="warm")
+            if _LOTS.get("items") is None or age_l > 90:
+                _lots_refresh(block=False, priority="warm")
         except Exception as e:
             log("sheets warm fail: %s" % e)
-        time.sleep(120)
+        time.sleep(45)
 
 
 def push_sheets(deal: dict) -> str:
@@ -876,14 +918,19 @@ def _unsold_drop_row(row) -> None:
     except (TypeError, ValueError):
         return
     items = _UNSOLD.get("items")
-    if not items or not row:
-        return
-    nxt = [it for it in items if int(it.get("row") or 0) != row]
-    if len(nxt) != len(items):
-        _unsold_set(nxt)
+    if items and row:
+        nxt = [it for it in items if int(it.get("row") or 0) != row]
+        if len(nxt) != len(items):
+            _unsold_set(nxt)
+    lots = _LOTS.get("items")
+    if lots and row:
+        for it in lots:
+            if int(it.get("row") or 0) == row:
+                it["sold"] = True
+        _lots_to_disk(lots)
 
 
-def _unsold_refresh(block: bool = False) -> None:
+def _unsold_refresh(block: bool = False, priority: str = "user") -> None:
     start = False
     with _UNSOLD["lock"]:
         if not _UNSOLD["busy"]:
@@ -894,7 +941,7 @@ def _unsold_refresh(block: bool = False) -> None:
 
     def worker():
         try:
-            r = sheets_call({"action": "unsold"}, attempts=2, deadline_s=20)
+            r = sheets_call({"action": "unsold"}, attempts=1, deadline_s=8, priority=priority)
             items = r.get("items") if r.get("ok") else None
             if isinstance(items, list):
                 _unsold_set(items)
@@ -911,56 +958,113 @@ def _unsold_refresh(block: bool = False) -> None:
             return
         threading.Thread(target=worker, name="unsold-refresh", daemon=True).start()
     if block:
-        ev.wait(15)
+        ev.wait(10)
 
 
 def fetch_unsold() -> list | None:
     _unsold_from_disk()
-    now = time.time()
     items = _UNSOLD.get("items")
-    age = now - (_UNSOLD.get("t") or 0)
-    if items is not None and age < 300:
-        if age > 60:
+    age = time.time() - (_UNSOLD.get("t") or 0)
+    if items is not None:
+        if age > 45:
             _unsold_refresh(block=False)
         return items
-    if items is not None:
-        _unsold_refresh(block=False)
-        return items
-    _unsold_refresh(block=True)
-    return _UNSOLD.get("items")
+    _unsold_refresh(block=False)
+    return None
+
+
+def _lots_from_disk() -> None:
+    if _LOTS["items"] is not None:
+        return
+    try:
+        raw = json.loads(LOTS_PATH.read_text(encoding="utf-8"))
+        items = raw.get("items")
+        if isinstance(items, list):
+            _LOTS["items"] = items
+            _LOTS["t"] = float(raw.get("t") or 0)
+            log("lots disk %s шт. age=%.0fs" % (len(items), time.time() - _LOTS["t"]))
+    except Exception:
+        pass
+
+
+def _lots_to_disk(items: list) -> None:
+    try:
+        LOTS_PATH.write_text(
+            json.dumps({"t": time.time(), "items": items}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _lots_set(items: list) -> None:
+    _LOTS["items"] = items
+    _LOTS["t"] = time.time()
+    _lots_to_disk(items)
+
+
+def _lots_refresh(block: bool = False, priority: str = "user") -> None:
+    start = False
+    with _LOTS["lock"]:
+        if not _LOTS["busy"]:
+            _LOTS["busy"] = True
+            _LOTS["done"] = threading.Event()
+            start = True
+        ev = _LOTS["done"]
+
+    def worker():
+        try:
+            r = sheets_call({"action": "lots", "mode": "all"}, attempts=1, deadline_s=8, priority=priority)
+            items = r.get("items") if r.get("ok") else None
+            if isinstance(items, list):
+                _lots_set(items)
+                log("lots refresh %s шт." % len(items))
+        except Exception as e:
+            log("lots refresh fail: %s" % e)
+        finally:
+            _LOTS["busy"] = False
+            ev.set()
+
+    if start:
+        if block:
+            worker()
+            return
+        threading.Thread(target=worker, name="lots-refresh", daemon=True).start()
+    if block:
+        ev.wait(10)
+
+
+def _filter_lots(items, mode="all", query=""):
+    q = (query or "").lower().strip()
+    out = []
+    for it in items or []:
+        if mode == "unsold" and it.get("sold"):
+            continue
+        if q:
+            blob = " ".join(
+                str(it.get(k) or "") for k in ("product", "category", "note", "buyer", "lot")
+            ).lower()
+            if q not in blob:
+                continue
+        out.append(it)
+    return out
 
 
 def fetch_lots(mode="all", query="") -> list | None:
-    r = sheets_call({"action": "lots", "mode": mode, "query": query})
-    if r.get("error") == "local":
+    _lots_from_disk()
+    items = _LOTS.get("items")
+    age = time.time() - (_LOTS.get("t") or 0)
+    if items is None:
+        _unsold_from_disk()
+        items = _UNSOLD.get("items")
+        age = time.time() - (_UNSOLD.get("t") or 0)
+    if items is None:
+        _lots_refresh(block=False)
+        _unsold_refresh(block=False)
         return None
-    if not r.get("ok"):
-        return None
-    items = r.get("items") or []
-    return items if isinstance(items, list) else []
-
-
-def fetch_inv_list() -> list | None:
-    r = sheets_call({"action": "inv_list"})
-    if r.get("error") == "local" or not r.get("ok"):
-        return None
-    items = r.get("entries") or []
-    return items if isinstance(items, list) else []
-
-
-def fetch_inv_get(session_id) -> list | None:
-    r = sheets_call({"action": "inv_get", "session_id": session_id})
-    if r.get("error") == "local" or not r.get("ok"):
-        return None
-    items = r.get("items") or []
-    return items if isinstance(items, list) else []
-
-
-def inv_state():
-    inv = SESSIONS.get(INV_KEY)
-    if isinstance(inv, dict) and inv.get("active"):
-        return inv
-    return None
+    if age > 45:
+        _lots_refresh(block=False)
+    return _filter_lots(items, mode, query)
 
 
 def remember_user(chat_id, u: dict) -> None:
@@ -986,23 +1090,6 @@ def user_name(chat_id) -> str:
     if isinstance(users, dict):
         return str(users.get(sid(chat_id)) or "") or "неизвестный"
     return "неизвестный"
-
-
-def period_str(d=None) -> str:
-    d = d or date.today()
-    return d.strftime("%m.%Y")
-
-
-def period_label(period: str) -> str:
-    period = str(period or "")
-    parts = period.split(".")
-    try:
-        m = int(parts[0])
-    except (ValueError, IndexError):
-        return period or "?"
-    name = INV_MONTHS[m - 1] if 1 <= m <= 12 else period
-    year = parts[1] if len(parts) > 1 else ""
-    return name + (" " + str(year) if year else "")
 
 
 def kassa_what(deal: dict) -> str:
@@ -1126,12 +1213,12 @@ def menu_text(info=None) -> str:
         + "</code>\n<i>"
         + src
         + "</i>\n\n"
-        + "кнопки внизу — закуп, продажа, лот, деньги, касса, инвентаризация"
+        + "кнопки внизу — закуп, продажа, лот, деньги, касса"
     )
 
 
 def balance_text(info=None) -> str:
-    info = info or fetch_balance(force=True)
+    info = info or peek_balance()
     hand = fmt_money(info.get("hand") or 0)
     start = fmt_money(info.get("start") or 0)
     inn = fmt_money(info.get("inn") or 0)
@@ -1196,6 +1283,7 @@ def ui(chat_id, text, markup=None, force_new=False):
         err = str(r.get("error") or "").lower()
         if "not modified" in err:
             return r
+        # старое сообщение не отредактировалось — шлём новое вниз, не молчим
     r = send(chat_id, text, markup)
     if r.get("ok"):
         try:
@@ -1214,6 +1302,8 @@ def go_menu(chat_id, prefix=""):
     if prefix:
         body = prefix + "\n\n" + body
     send(chat_id, body, reply_kb())
+    if time.time() - (_CASH.get("t") or 0) > 30:
+        bg(fetch_balance, True)
 
 
 def start_deal(chat_id, kind=None):
@@ -1329,27 +1419,6 @@ def go_back(chat_id):
         else:
             go_menu(chat_id)
         return
-    if kind == "inv":
-        mine = inv_state() and inv_state().get("by") == chat_id
-        if step == "inv_item":
-            inv_list(chat_id, s.get("page") or 0)
-        elif step == "inv_list":
-            inv_categories(chat_id) if mine else go_menu(chat_id)
-        elif step in ("inv_cats", "inv_home", "inv_begin"):
-            inv_home(chat_id) if mine else go_menu(chat_id)
-        elif step in ("inv_fin", "inv_cx"):
-            inv_categories(chat_id) if mine else go_menu(chat_id)
-        elif step == "inv_search":
-            inv_list(chat_id, 0)
-        elif step == "inv_month":
-            inv_month_view(chat_id, s.get("inv_sid") or 0, s.get("inv_page") or 0)
-        elif step == "inv_months":
-            go_menu(chat_id)
-        elif step == "inv_fix":
-            inv_month_view(chat_id, s.get("inv_sid") or 0, s.get("inv_page") or 0)
-        else:
-            go_menu(chat_id)
-        return
     go_menu(chat_id)
 
 
@@ -1368,6 +1437,7 @@ def start_cash(chat_id):
                 cancel_row(),
             ]
         ),
+        force_new=True,
     )
 
 
@@ -1479,6 +1549,11 @@ def perform_undo(chat_id):
     if not deal:
         go_menu(chat_id, "уже нечего отменять.")
         return
+    ui(chat_id, "отменяю…", kb([cancel_row()]))
+    bg(_perform_undo_body, chat_id, deal)
+
+
+def _perform_undo_body(chat_id, deal):
     t = deal.get("type")
     extras = extras_for(deal)
     row = resolve_row(deal)
@@ -1609,8 +1684,7 @@ def perform_undo(chat_id):
 
 
 def start_edit(chat_id):
-    s = sess(chat_id)
-    SESSIONS[sid(chat_id)] = {"step": "edit_how", "type": "edit", "msg_id": s.get("msg_id")}
+    SESSIONS[sid(chat_id)] = {"step": "edit_how", "type": "edit"}
     persist_sess()
     ui(
         chat_id,
@@ -1623,6 +1697,7 @@ def start_edit(chat_id):
                 cancel_row(),
             ]
         ),
+        force_new=True,
     )
 
 
@@ -1748,28 +1823,48 @@ def show_item_list(chat_id, page=0, force_new=False):
     )
 
 
-def load_unsold_or_fail(chat_id) -> bool:
+def load_unsold_or_fail(chat_id, then="cats") -> bool:
     items = fetch_unsold()
-    if items is None:
-        ui(
-            chat_id,
-            screen("sell", "sell_how", "таблица сейчас не отвечает.\nнажми ещё раз через пару секунд."),
-            kb(
-                [
-                    [btn("📂 по категории", "m:cats")],
-                    [btn("🔍 поиск по слову", "m:search")],
-                    [btn("📋 все не проданные", "c:all")],
-                    nav_row(),
-                ]
-            ),
-        )
-        return False
-    sess(chat_id)["unsold"] = items
-    persist_sess()
-    if not items:
-        send(chat_id, "в таблице нет не проданного товара.", reply_kb())
-        return False
-    return True
+    if items is not None:
+        sess(chat_id)["unsold"] = items
+        persist_sess()
+        if not items:
+            send(chat_id, "в таблице нет не проданного товара.", reply_kb())
+            return False
+        return True
+    ui(chat_id, screen("sell", "sell_how", "подгружаю непроданное…"), kb([nav_row()]))
+
+    def work():
+        _unsold_refresh(block=True)
+        items = _UNSOLD.get("items")
+        if items is None:
+            ui(
+                chat_id,
+                screen("sell", "sell_how", "таблица сейчас не отвечает.\nнажми ещё раз."),
+                kb(
+                    [
+                        [btn("📂 по категории", "m:cats")],
+                        [btn("🔍 поиск по слову", "m:search")],
+                        [btn("📋 все не проданные", "c:all")],
+                        nav_row(),
+                    ]
+                ),
+            )
+            return
+        sess(chat_id)["unsold"] = items
+        persist_sess()
+        if not items:
+            send(chat_id, "в таблице нет не проданного товара.", reply_kb())
+            return
+        if then == "search":
+            ask_search(chat_id)
+        elif then == "all":
+            show_item_list(chat_id, 0)
+        else:
+            show_categories(chat_id, for_sell=True)
+
+    bg(work)
+    return False
 
 
 def ask_sell_how(chat_id):
@@ -2111,9 +2206,11 @@ def show_edit_item(chat_id):
 
 
 def commit(chat_id):
-    ui(chat_id, "записываю…", kb([cancel_row()]))
-
     s = sess(chat_id)
+    if not s.get("type"):
+        # повторное нажатие после уже записанной сделки: сессия чиста
+        go_menu(chat_id, "нет активной сделки — начни заново.")
+        return
     deal = {
         "id": datetime.now().strftime("%Y%m%d%H%M%S"),
         "ts": datetime.now().isoformat(timespec="seconds"),
@@ -2141,14 +2238,7 @@ def commit(chat_id):
     deal["kassa_what"] = kassa_what(deal)
     deal["cash_dir"] = cash_dir_for(deal)
     append_deal(deal)
-    wr = sheets_call(dict(deal, action="write"))
-    if wr.get("ok") and wr.get("sheet_row"):
-        deal["sheet_row"] = wr.get("sheet_row")
-    if deal.get("type") == "sell":
-        _unsold_drop_row(deal.get("sheet_row"))
-    sheets = "ok" if wr.get("ok") else (wr.get("error") or "fail")
-    if sheets == "local" or wr.get("error") == "local":
-        sheets = "local"
+    extras = []
     for what, amt, pay in (
         ("Доставка", s.get("delivery") or 0, s.get("delivery_pay")),
         ("Расходник", s.get("consumable") or 0, s.get("consumable_pay")),
@@ -2163,17 +2253,12 @@ def commit(chat_id):
             extra_d["who"] = "other_out"
             extra_d["comment"] = what + " · " + (deal.get("product") or "")
             append_deal(extra_d)
-            push_sheets(extra_d)
+            extras.append(extra_d)
+    if deal.get("type") == "sell":
+        _unsold_drop_row(deal.get("sheet_row"))
     _CASH["t"] = 0
     _CASH["data"] = None
     info = local_balance()
-    extra = ""
-    if sheets == "local":
-        extra = "\n<i>пока записано у бота. таблица подключится, когда будет вебхук.</i>"
-    elif sheets != "ok":
-        extra = "\n<i>в таблицу не ушло, но сделка сохранена у бота.</i>"
-    else:
-        extra = "\n<i>строка ушла в таблицу.</i>"
     go_menu(
         chat_id,
         "✓  записал\n\n"
@@ -2181,9 +2266,20 @@ def commit(chat_id):
         + "\n\nна руках  <code>"
         + fmt_money(info.get("hand") or 0)
         + "</code>"
-        + extra
+        + "\n<i>пишу в таблицу…</i>"
         + "\n\nесли человек слился — «Отменить последнее»",
     )
+
+    def work():
+        wr = sheets_call(dict(deal, action="write"))
+        for extra_d in extras:
+            push_sheets(extra_d)
+        if wr.get("ok"):
+            log("commit sheets ok row=%s" % wr.get("sheet_row"))
+        elif wr.get("error") not in ("local",):
+            send(chat_id, "сделка у бота есть, таблица не приняла — глянь таблицу или повтори.")
+
+    bg(work)
 
 
 def after_who(chat_id):
@@ -2203,16 +2299,12 @@ def set_date_and_continue(chat_id, ds: str):
     kind = s.get("edit_field")
     if s.get("type") == "edit" and kind in ("buy", "sell"):
         field = "buy_date" if kind == "buy" else "sell_date"
-        r = sheets_call({"action": "update", "sheet_row": s.get("edit_row"), "fields": {field: ds}})
-        if r.get("ok"):
-            s.setdefault("edit_item", {})[("buy" if kind == "buy" else "sell")] = ds
-            s["edit_field"] = None
-            persist_sess()
-            ui(chat_id, "дата обновлена: <b>" + ds + "</b>")
-            show_edit_item(chat_id)
-        else:
-            ui(chat_id, "не смог записать дату.")
-            go_menu(chat_id)
+        s.setdefault("edit_item", {})[("buy" if kind == "buy" else "sell")] = ds
+        s["edit_field"] = None
+        persist_sess()
+        show_edit_item(chat_id)
+        row = s.get("edit_row")
+        bg(sheets_call, {"action": "update", "sheet_row": row, "fields": {field: ds}})
         return
     s["date"] = ds
     persist_sess()
@@ -2275,13 +2367,10 @@ def apply_edit_text(chat_id, text: str):
     else:
         go_menu(chat_id, "не понял, что правим.")
         return
-    r = sheets_call({"action": "update", "sheet_row": row, "fields": fields})
-    if not r.get("ok"):
-        ui(chat_id, "в таблицу не ушло.", kb([nav_row()]))
-        return
     s["edit_field"] = None
     persist_sess()
     show_edit_item(chat_id)
+    bg(sheets_call, {"action": "update", "sheet_row": row, "fields": fields})
 
 
 def normalize_cmd(text: str) -> str:
@@ -2291,16 +2380,30 @@ def normalize_cmd(text: str) -> str:
 
 
 def show_balance(chat_id, via_ui=False):
-    text = balance_text()
+    markup = kb([[btn("↻ обновить", "m:bal")], [btn("‹ меню", "m:cancel")]]) if via_ui else reply_kb()
+    text = balance_text(peek_balance())
     if via_ui:
-        ui(chat_id, text, kb([[btn("↻ обновить", "m:bal")], [btn("‹ меню", "m:cancel")]]))
+        ui(chat_id, text, markup)
     else:
-        send(chat_id, text, reply_kb())
+        send(chat_id, text, markup)
+
+    def refresh():
+        info = fetch_balance(force=True)
+        nxt = balance_text(info)
+        if nxt == text:
+            return
+        if via_ui:
+            ui(chat_id, nxt, markup)
+        else:
+            send(chat_id, nxt, markup)
+
+    bg(refresh)
 
 
 def on_text(chat_id, text: str):
     text = (text or "").strip()
     cmd = normalize_cmd(text)
+    log("txt %s cmd=%s" % (text[:40], cmd[:40]))
     if text in ("/start", "/menu") or cmd in ("меню", "start"):
         go_menu(chat_id)
         return
@@ -2315,7 +2418,7 @@ def on_text(chat_id, text: str):
     ):
         show_balance(chat_id)
         return
-    if text == "/edit" or cmd in ("лот", "изменить лот"):
+    if text == "/edit" or cmd in ("лот", "изменить лот") or cmd.endswith(" лот"):
         start_edit(chat_id)
         return
     if cmd in ("закуп",):
@@ -2329,9 +2432,6 @@ def on_text(chat_id, text: str):
         return
     if text == "/undo" or cmd in ("отменить последнее", "отменить действие"):
         start_undo(chat_id)
-        return
-    if text == "/inv" or text == "/inventory" or cmd in ("инвентаризация", "инвентаризации"):
-        start_inventory(chat_id)
         return
     s = sess(chat_id)
     step = s.get("step") or "idle"
@@ -2392,20 +2492,25 @@ def on_text(chat_id, text: str):
         if s.get("type") == "edit":
             items = fetch_lots("all", s["query"])
             if items is None:
-                ui(chat_id, "таблица не отвечает.", kb([nav_row()]))
+                ui(chat_id, "подгружаю лоты…")
+                q = s["query"]
+
+                def work():
+                    _lots_refresh(block=True)
+                    got = fetch_lots("all", q) or []
+                    ss = sess(chat_id)
+                    ss["lots"] = got
+                    persist_sess()
+                    if not got:
+                        ui(chat_id, "ничего не нашёл.", kb([nav_row()]))
+                        return
+                    show_item_list(chat_id, 0)
+
+                bg(work)
                 return
             s["lots"] = items
             persist_sess()
         show_item_list(chat_id, 0)
-        return
-    if step == "inv_search":
-        if len(text) < 1:
-            ui(chat_id, "напиши хотя бы пару символов.", kb([nav_row()]))
-            return
-        s["query"] = text[:40]
-        s["filter_cat"] = s.get("filter_cat") or "all"
-        persist_sess()
-        inv_list(chat_id, 0)
         return
     if step == "date_custom":
         ds = parse_date(text)
@@ -2473,10 +2578,21 @@ def pick_edit(chat_id, row: int):
             picked = it
             break
     if not picked:
-        r = sheets_call({"action": "lot", "sheet_row": row})
-        picked = r.get("item") if r.get("ok") else None
-    if not picked:
-        ui(chat_id, "не нашёл строку.")
+        ui(chat_id, "подгружаю лот…")
+
+        def work():
+            r = sheets_call({"action": "lot", "sheet_row": row}, attempts=1, deadline_s=8)
+            got = r.get("item") if r.get("ok") else None
+            if not got:
+                ui(chat_id, "не нашёл строку.")
+                return
+            ss = sess(chat_id)
+            ss["edit_row"] = row
+            ss["edit_item"] = got
+            persist_sess()
+            show_edit_item(chat_id)
+
+        bg(work)
         return
     s["edit_row"] = row
     s["edit_item"] = picked
@@ -2485,791 +2601,60 @@ def pick_edit(chat_id, row: int):
 
 
 def load_edit_list(chat_id, mode: str):
-    ui(chat_id, "смотрю таблицу…")
     items = fetch_lots(mode)
-    if items is None:
-        ui(chat_id, "таблица не отвечает.")
-        go_menu(chat_id)
-        return
-    s = sess(chat_id)
-    s["lots"] = items
-    s["unsold"] = items
-    s["filter_cat"] = "all"
-    s["query"] = ""
-    persist_sess()
     if not items:
-        ui(chat_id, "пусто.")
-        go_menu(chat_id)
-        return
-    show_item_list(chat_id, 0)
-
-
-def inv_counts(inv):
-    marks = inv.get("marks") or {}
-    ok = sum(1 for v in marks.values() if v == INV_OK)
-    miss = sum(1 for v in marks.values() if v == INV_MISS)
-    return len(inv.get("items") or []), ok, miss
-
-
-def inv_guard(chat_id) -> bool:
-    inv = inv_state()
-    if not inv:
-        start_inventory(chat_id)
-        return False
-    if inv.get("by") != chat_id:
-        inv_foreign(chat_id, inv)
-        return False
-    return True
-
-
-def inv_item_card(it, mark=None) -> str:
-    rows = [lot_card(it)]
-    cur = {INV_OK: "✅ на месте", INV_MISS: "❌ отсутствует"}.get(mark or "")
-    if cur:
-        rows.append("")
-        rows.append("Инвентаризация: <b>" + cur + "</b>")
-    return "\n".join(rows)
-
-
-def inv_item_label(it, mark) -> str:
-    icon = {INV_OK: "✅", INV_MISS: "❌"}.get(mark or "", "⬜")
-    name = str(it.get("product") or "?")
-    tail = fmt_money(it.get("cost") or 0)
-    room = 58 - len(icon) - len(tail) - 3
-    if len(name) > room:
-        name = name[: max(8, room)]
-    return ("%s %s · %s" % (icon, name, tail))[:64]
-
-
-def start_inventory(chat_id):
-    inv = inv_state()
-    if inv:
-        if inv.get("by") == chat_id:
-            inv_home(chat_id)
-        else:
-            inv_foreign(chat_id, inv)
-        return
-    s = sess(chat_id)
-    SESSIONS[sid(chat_id)] = {"step": "inv_begin", "type": "inv", "msg_id": s.get("msg_id")}
-    persist_sess()
-    items = fetch_unsold()
-    if not items:
-        ui(
-            chat_id,
-            "<b>Инвентаризация</b>\n\nсписок лотов сейчас недоступен.\nможно открыть прошлые инвентаризации.",
-            kb([[btn("📜 прошлые", "iv:hist")], [btn("↻ ещё раз", "m:inv")], [btn("‹ меню", "m:cancel")]]),
-            force_new=True,
-        )
-        return
-    s = sess(chat_id)
-    s["unsold"] = items
-    s["filter_cat"] = "all"
-    s["query"] = ""
-    persist_sess()
-    ui(
-        chat_id,
-        "<b>Инвентаризация</b>\n"
-        + HR
-        + "\nнепроданных лотов: <b>"
-        + str(len(items))
-        + "</b>\nпройди по коробкам и отметь, что на месте.\nне отмеченное посчитаю отсутствующим.",
-        kb(
-            [
-                [btn("▶️ начать", "iv:begin")],
-                [btn("📜 прошлые", "iv:hist")],
-                [btn("‹ меню", "m:cancel")],
-            ]
-        ),
-        force_new=True,
-    )
-
-
-def inv_home(chat_id):
-    inv = inv_state()
-    if not inv:
-        start_inventory(chat_id)
-        return
-    s = sess(chat_id)
-    SESSIONS[sid(chat_id)] = {
-        "step": "inv_home",
-        "type": "inv",
-        "msg_id": s.get("msg_id"),
-        "unsold": inv.get("items") or [],
-        "filter_cat": "all",
-        "query": "",
-        "page": 0,
-    }
-    persist_sess()
-    total, ok, miss = inv_counts(inv)
-    started = str(inv.get("started") or "")[:16].replace("T", " ")
-    ui(
-        chat_id,
-        "<b>Инвентаризация идёт</b>\n"
-        + HR
-        + "\nначал "
-        + esc(str(inv.get("by_name") or ""))
-        + " · "
-        + started
-        + "\nотмечено <b>"
-        + str(ok + miss)
-        + "</b> из <b>"
-        + str(total)
-        + "</b> · ✅ "
-        + str(ok)
-        + " · ❌ "
-        + str(miss),
-        kb(
-            [
-                [btn("продолжить", "iv:cats")],
-                [btn("🏁 завершить", "iv:fin")],
-                [btn("📜 прошлые", "iv:hist")],
-                [btn("🚪 отменить инвентаризацию", "iv:cxo")],
-            ]
-        ),
-    )
-
-
-def inv_foreign(chat_id, inv):
-    total, ok, miss = inv_counts(inv)
-    started = str(inv.get("started") or "")[:16].replace("T", " ")
-    ui(
-        chat_id,
-        "<b>Инвентаризация уже идёт</b>\n"
-        + HR
-        + "\nначал "
-        + esc(str(inv.get("by_name") or ""))
-        + " · "
-        + started
-        + "\nотмечено "
-        + str(ok + miss)
-        + " из "
-        + str(total)
-        + "\n\nвторую не начну — дождись завершения.",
-        kb([[btn("📜 прошлые", "iv:hist")], [btn("‹ меню", "m:cancel")]]),
-    )
-
-
-def inv_begin(chat_id):
-    inv = inv_state()
-    if inv:
-        if inv.get("by") == chat_id:
-            inv_home(chat_id)
-        else:
-            inv_foreign(chat_id, inv)
-        return
-    s = sess(chat_id)
-    items = s.get("unsold") or fetch_unsold() or []
-    if not items:
-        start_inventory(chat_id)
-        return
-    name = user_name(chat_id)
-    ui(chat_id, "открываю инвентаризацию…")
-    r = sheets_call({"action": "inv_start", "who": name}, attempts=1, deadline_s=12)
-    session_id = 0
-    if r.get("ok"):
-        try:
-            session_id = int(r.get("session_id") or 0)
-        except (TypeError, ValueError):
-            session_id = 0
-    snapshot = [
-        {
-            "row": int(it.get("row") or 0),
-            "product": str(it.get("product") or ""),
-            "category": str(it.get("category") or "Другое"),
-            "lot": str(it.get("lot") or ""),
-            "buy": str(it.get("buy") or ""),
-            "cost": int(it.get("cost") or 0),
-        }
-        for it in items
-    ]
-    SESSIONS[INV_KEY] = {
-        "active": True,
-        "by": chat_id,
-        "by_name": name,
-        "started": datetime.now().isoformat(timespec="seconds"),
-        "session_id": session_id,
-        "items": snapshot,
-        "marks": {},
-    }
-    persist_sess()
-    inv_categories(chat_id)
-
-
-def inv_categories(chat_id):
-    if not inv_guard(chat_id):
-        return
-    inv = inv_state()
-    items = inv.get("items") or []
-    s = sess(chat_id)
-    s["step"] = "inv_cats"
-    s["unsold"] = items
-    s["filter_cat"] = "all"
-    s["query"] = ""
-    s["page"] = 0
-    persist_sess()
-    counts = cat_counts(items)
-    rows = []
-    pair = []
-    names = [c for c in CATS if counts.get(c)]
-    extra = [c for c in sorted(counts) if c not in CATS]
-    for name in names + extra:
-        pair.append(btn(cat_label(name, counts[name]), "iv:c:" + name[:24]))
-        if len(pair) == 2:
-            rows.append(pair)
-            pair = []
-    if pair:
-        rows.append(pair)
-    rows.append([btn("все · %s" % len(items), "iv:c:all")])
-    rows.append([btn("🏁 завершить", "iv:fin")])
-    rows.append(nav_row())
-    total, ok, miss = inv_counts(inv)
-    ui(
-        chat_id,
-        "<b>Инвентаризация</b>\nотмечено %d из %d · ✅ %d · ❌ %d\n\nчто смотрим?"
-        % (ok + miss, total, ok, miss),
-        kb(rows),
-    )
-
-
-def inv_list(chat_id, page=0, force_new=False):
-    if not inv_guard(chat_id):
-        return
-    inv = inv_state()
-    s = sess(chat_id)
-    items = filtered_items(s)
-    marks = inv.get("marks") or {}
-    if not items:
-        ui(chat_id, "по этому фильтру ничего нет.", kb([[btn("‹ категории", "iv:cats")]]))
-        return
-    page = max(0, page)
-    max_page = max(0, (len(items) - 1) // PAGE)
-    if page > max_page:
-        page = max_page
-    s["page"] = page
-    s["step"] = "inv_list"
-    persist_sess()
-    rows = []
-    for it in items[page * PAGE : (page + 1) * PAGE]:
-        mark = marks.get(str(it.get("row")))
-        rows.append([btn(inv_item_label(it, mark), "iv:it:" + str(it.get("row")))])
-    nav = []
-    if page > 0:
-        nav.append(btn("‹", "iv:pg:%d" % (page - 1)))
-    nav.append(btn("%d / %d" % (page + 1, max_page + 1), "iv:pg:%d" % page))
-    if page < max_page:
-        nav.append(btn("›", "iv:pg:%d" % (page + 1)))
-    rows.append(nav)
-    rows.append([btn("‹ категории", "iv:cats"), btn("🔍 поиск", "iv:srch")])
-    rows.append([btn("🏁 завершить", "iv:fin")])
-    total, ok, miss = inv_counts(inv)
-    q = s.get("query") or ""
-    cat = s.get("filter_cat")
-    bits = ["%s шт." % len(items)]
-    if cat and cat != "all":
-        bits.append(cat)
-    if q:
-        bits.append("«" + q + "»")
-    ui(
-        chat_id,
-        "<b>Инвентаризация</b>\nотмечено %d из %d · ✅ %d · ❌ %d\n\n%s"
-        % (ok + miss, total, ok, miss, " · ".join(bits)),
-        kb(rows),
-        force_new=force_new,
-    )
-
-
-def inv_ask_search(chat_id):
-    s = sess(chat_id)
-    s["step"] = "inv_search"
-    persist_sess()
-    ui(
-        chat_id,
-        "<b>Инвентаризация</b>\n\nнапиши кусок названия.\nнапример: <code>580</code> или <code>xeon</code>",
-        kb([[btn("‹ к списку", "iv:cats")]]),
-    )
-
-
-def inv_item(chat_id, row: int):
-    if not inv_guard(chat_id):
-        return
-    inv = inv_state()
-    picked = None
-    for it in inv.get("items") or []:
-        if int(it.get("row") or 0) == row:
-            picked = it
-            break
-    if not picked:
-        ui(chat_id, "лот не в списке инвентаризации.")
-        inv_list(chat_id, sess(chat_id).get("page") or 0)
-        return
-    s = sess(chat_id)
-    s["step"] = "inv_item"
-    s["inv_row"] = row
-    persist_sess()
-    marks = inv.get("marks") or {}
-    ui(
-        chat_id,
-        inv_item_card(picked, marks.get(str(row))),
-        kb(
-            [
-                [btn("✔️ на месте", "iv:ok:" + str(row)), btn("❌ отсутствует", "iv:no:" + str(row))],
-                [btn("‹ к списку", "iv:back")],
-            ]
-        ),
-    )
-
-
-def inv_mark(chat_id, row: int, mark: str):
-    if not inv_guard(chat_id):
-        return
-    inv = inv_state()
-    marks = inv.setdefault("marks", {})
-    marks[str(row)] = mark
-    persist_sess()
-    inv_list(chat_id, sess(chat_id).get("page") or 0)
-
-
-def inv_finish(chat_id):
-    if not inv_guard(chat_id):
-        return
-    inv = inv_state()
-    s = sess(chat_id)
-    s["step"] = "inv_fin"
-    persist_sess()
-    total, ok, miss = inv_counts(inv)
-    unmarked = total - ok - miss
-    rows = [
-        "🏁 <b>Завершить инвентаризацию?</b>",
-        HR,
-        "всего лотов     " + str(total),
-        "✅ на месте     " + str(ok),
-        "❌ отсутствует  " + str(miss),
-    ]
-    if unmarked > 0:
-        rows.append("⬜ не отмечено   " + str(unmarked) + " — посчитаю отсутствующими")
-    ui(
-        chat_id,
-        "\n".join(rows),
-        kb(
-            [
-                [btn("✓  записать и завершить", "iv:go")],
-                [btn("‹ к списку", "iv:cats")],
-                [btn("🚪 отменить инвентаризацию", "iv:cxo")],
-            ]
-        ),
-    )
-
-
-def inv_finish_confirm(chat_id, force=False):
-    inv = inv_state()
-    if not inv:
-        go_menu(chat_id, "инвентаризация уже не идёт.")
-        return
-    if inv.get("by") != chat_id:
-        inv_foreign(chat_id, inv)
-        return
-    total, ok, miss = inv_counts(inv)
-    marks = inv.get("marks") or {}
-    unmarked = total - ok - miss
-    items = []
-    for it in inv.get("items") or []:
-        m = marks.get(str(it.get("row")))
-        if m == INV_OK:
-            status = INV_SHEET_OK
-        elif m == INV_MISS:
-            status = INV_SHEET_MISS
-        else:
-            status = INV_SHEET_UNMARKED
-        items.append(
-            {
-                "sheet_row": int(it.get("row") or 0),
-                "product": str(it.get("product") or ""),
-                "buy": str(it.get("buy") or ""),
-                "cost": int(it.get("cost") or 0),
-                "status": status,
-            }
-        )
-    period = period_str()
-    saved = False
-    if not force:
-        r = sheets_call(
-            {
-                "action": "inv_save",
-                "session_id": inv.get("session_id") or 0,
-                "date": today_str(),
-                "period": period,
-                "who": inv.get("by_name") or "",
-                "counts": {"total": total, "ok": ok, "miss": miss + unmarked},
-                "items": items,
-            }
-        )
-        if r.get("ok") and (r.get("wrote") is not None or r.get("session_id")):
-            saved = True
-        if not saved:
-            ui(
-                chat_id,
-                "таблица не ответила, ничего не записал.\nинвентаризация продолжает идти.",
-                kb(
-                    [
-                        [btn("↻ повторить", "iv:go")],
-                        [btn("закончить без записи", "iv:drop")],
-                        [btn("‹ к списку", "iv:cats")],
-                    ]
-                ),
-            )
-            return
-    SESSIONS.pop(INV_KEY, None)
-    persist_sess()
-    rows = [
-        "🏁 <b>Инвентаризация записана</b>",
-        HR,
-        "период       " + period_label(period),
-        "всего        " + str(total),
-        "✅ на месте  " + str(ok),
-        "❌ отсутствует  " + str(miss + unmarked),
-    ]
-    if saved:
-        rows.append("<i>записал в таблицу, лист «Инвентаризация».</i>")
-    else:
-        rows.append("<i>в таблицу не записывал — закончено без записи.</i>")
-    gone = [it for it in items if it["status"] != INV_SHEET_OK]
-    if gone:
-        rows.append("")
-        rows.append("<b>отсутствуют:</b>")
-        for it in gone[:15]:
-            rows.append("• " + esc(it["product"]) + " · " + fmt_money(it["cost"]))
-        if len(gone) > 15:
-            rows.append("<i>и ещё " + str(len(gone) - 15) + "</i>")
-    go_menu(chat_id, "\n".join(rows))
-
-
-def inv_cancel_ask(chat_id):
-    if not inv_guard(chat_id):
-        return
-    s = sess(chat_id)
-    s["step"] = "inv_cx"
-    persist_sess()
-    ui(
-        chat_id,
-        "🚪 отменить инвентаризацию?\nотметки пропадут, в журнале появится «отменена».",
-        kb([[btn("да, отменить", "iv:cxd")], [btn("‹ нет", "iv:cats")]]),
-    )
-
-
-def inv_cancel_do(chat_id):
-    inv = inv_state()
-    if not inv:
-        go_menu(chat_id, "инвентаризация уже не идёт.")
-        return
-    if inv.get("by") == chat_id and inv.get("session_id"):
-        sheets_call({"action": "inv_cancel", "session_id": inv.get("session_id")})
-    SESSIONS.pop(INV_KEY, None)
-    persist_sess()
-    go_menu(chat_id, "инвентаризация отменена, отметки сброшены.")
-
-
-def inv_history(chat_id):
-    s = sess(chat_id)
-    SESSIONS[sid(chat_id)] = {
-        "step": "inv_months",
-        "type": "inv",
-        "msg_id": s.get("msg_id"),
-    }
-    persist_sess()
-    ui(chat_id, "смотрю журнал…")
-    r = sheets_call({"action": "inv_list"}, attempts=1, deadline_s=12)
-    entries = r.get("entries") if r.get("ok") else None
-    if not isinstance(entries, list):
-        ui(
-            chat_id,
-            "журнал сейчас не открылся. попробуй ещё раз.",
-            kb([[btn("↻ ещё раз", "iv:hist")], [btn("‹ меню", "m:cancel")]]),
-        )
-        return
-    s = sess(chat_id)
-    s["inv_entries"] = entries
-    persist_sess()
-    done = {}
-    for e in entries:
-        status = str(e.get("status") or "")
-        if "завершена" not in status:
-            continue
-        p = str(e.get("period") or "")
-        if not p:
-            continue
-        prev = done.get(p)
-        if not prev or int(e.get("id") or 0) > int(prev.get("id") or 0):
-            done[p] = e
-    rows = []
-    inv = inv_state()
-    if inv:
-        total, ok, miss = inv_counts(inv)
-        rows.append([btn("🟡 идёт сейчас · %d/%d" % (ok + miss, total), "iv:home")])
-    for p in sorted(done, reverse=True):
-        e = done[p]
-        label = "%s · всего %s · ❌ %s" % (period_label(p), e.get("total") or "?", e.get("miss") or "?")
-        rows.append([btn(label[:60], "iv:h:%s" % e.get("id"))])
-    if not rows:
-        rows.append([btn("завершённых пока нет", "iv:none")])
-    rows.append([btn("‹ меню", "m:cancel")])
-    ui(
-        chat_id,
-        "<b>Инвентаризации по месяцам</b>\n\n<i>просмотр за месяц. отсутствующие можно поправить.</i>",
-        kb(rows),
-    )
-
-
-def inv_month_view(chat_id, session_id: int, page=0, refresh=False):
-    s = sess(chat_id)
-    items = s.get("inv_items") or []
-    if refresh or not items or s.get("inv_sid") != session_id:
-        ui(chat_id, "смотрю журнал…")
-        got = fetch_inv_get(session_id)
-        if got is None:
-            ui(chat_id, "таблица не отвечает.")
-            return
-        items = got
-    s["step"] = "inv_month"
-    s["inv_sid"] = session_id
-    s["inv_items"] = items
-    entry = None
-    for e in s.get("inv_entries") or []:
-        if int(e.get("id") or 0) == session_id:
-            entry = e
-            break
-    if entry is None:
-        entries = fetch_inv_list() or []
-        s["inv_entries"] = entries
-        for e in entries:
-            if int(e.get("id") or 0) == session_id:
-                entry = e
-                break
-    missing = [it for it in items if str(it.get("status") or "").startswith("❌")]
-    okc = len(items) - len(missing)
-    head = [
-        "<b>" + period_label(str((entry or {}).get("period") or "")) + "</b>",
-        HR,
-    ]
-    if entry:
-        if entry.get("date"):
-            head.append(line("Дата", str(entry.get("date"))))
-        if entry.get("who"):
-            head.append(line("Проводил", esc(str(entry.get("who")))))
-    head.append(line("Всего", str(len(items))))
-    head.append(line("На месте", str(okc)))
-    head.append(line("Отсутствует", str(len(missing))))
-    head.append("")
-    head.append("<i>отсутствующие — тапни, чтобы поправить</i>")
-    rows = []
-    if missing:
-        page = max(0, page)
-        max_page = max(0, (len(missing) - 1) // PAGE)
-        if page > max_page:
-            page = max_page
-        s["inv_page"] = page
-        for it in missing[page * PAGE : (page + 1) * PAGE]:
-            label = ("%s · %s" % (str(it.get("product") or "?"), fmt_money(it.get("cost") or 0)))[:60]
-            rows.append([btn(label, "iv:fix:%s:%s" % (session_id, it.get("sheet_row")))])
-        nav = []
-        if page > 0:
-            nav.append(btn("‹", "iv:mp:%s:%d" % (session_id, page - 1)))
-        nav.append(btn("%d / %d" % (page + 1, max_page + 1), "iv:mp:%s:%d" % (session_id, page)))
-        if page < max_page:
-            nav.append(btn("›", "iv:mp:%s:%d" % (session_id, page + 1)))
-        rows.append(nav)
-    else:
-        s["inv_page"] = 0
-        rows.append([btn("всё на месте", "iv:none")])
-    rows.append([btn("‹ к месяцам", "iv:hist")])
-    persist_sess()
-    ui(chat_id, "\n".join(head), kb(rows))
-
-
-def inv_fix_card(chat_id, session_id: int, sheet_row: int):
-    s = sess(chat_id)
-    it = None
-    for x in s.get("inv_items") or []:
-        if int(x.get("sheet_row") or 0) == sheet_row:
-            it = x
-            break
-    if it is None:
-        items = fetch_inv_get(session_id) or []
-        s["inv_items"] = items
-        persist_sess()
-        for x in items:
-            if int(x.get("sheet_row") or 0) == sheet_row:
-                it = x
-                break
-    if it is None:
-        ui(chat_id, "не нашёл этот лот в журнале.")
-        return
-    s["step"] = "inv_fix"
-    s["inv_fix_row"] = sheet_row
-    persist_sess()
-    rows = [
-        "📦 <b>" + esc(str(it.get("product") or "?")) + "</b>",
-        HR,
-        line("Закуп", fmt_money(it.get("cost") or 0)),
-        line("Было", esc(str(it.get("status") or ""))),
-    ]
-    if it.get("fixed"):
-        rows.append(line("Правка", esc(str(it.get("fixed")))))
-    rows.append("")
-    rows.append("что теперь?")
-    ui(
-        chat_id,
-        "\n".join(rows),
-        kb(
-            [
-                [btn("✅ на месте", "iv:fx:%s:%s:ok" % (session_id, sheet_row))],
-                [btn("❌ отсутствует", "iv:fx:%s:%s:no" % (session_id, sheet_row))],
-                [btn("‹ назад", "iv:h:%s" % session_id)],
-            ]
-        ),
-    )
-
-
-def inv_fix_apply(chat_id, session_id: int, sheet_row: int, mark: str):
-    status = INV_SHEET_OK if mark == "ok" else INV_SHEET_MISS
-    r = sheets_call(
-        {
-            "action": "inv_update",
-            "session_id": session_id,
-            "sheet_row": sheet_row,
-            "status": status,
-            "fixed": today_str() + " · " + user_name(chat_id),
-        }
-    )
-    if not r.get("ok") or not r.get("row"):
-        ui(chat_id, "таблица не ответила, правка не записалась.")
-        return
-    s = sess(chat_id)
-    for x in s.get("inv_items") or []:
-        if int(x.get("sheet_row") or 0) == sheet_row:
-            x["status"] = status
-            x["fixed"] = today_str()
-    persist_sess()
-    inv_month_view(chat_id, session_id, s.get("inv_page") or 0, refresh=True)
-
-
-def on_inv_callback(chat_id, data):
-    s = sess(chat_id)
-    if data == "iv:begin":
-        inv_begin(chat_id)
-        return
-    if data == "iv:hist":
-        inv_history(chat_id)
-        return
-    if data == "iv:home":
-        inv = inv_state()
-        if not inv:
-            start_inventory(chat_id)
-        elif inv.get("by") == chat_id:
-            inv_home(chat_id)
-        else:
-            inv_foreign(chat_id, inv)
-        return
-    if data == "iv:cats":
-        if inv_guard(chat_id):
-            inv_categories(chat_id)
-        return
-    if data == "iv:back":
-        inv_list(chat_id, s.get("page") or 0)
-        return
-    if data == "iv:srch":
-        inv_ask_search(chat_id)
-        return
-    if data == "iv:fin":
-        inv_finish(chat_id)
-        return
-    if data == "iv:go":
-        inv_finish_confirm(chat_id)
-        return
-    if data == "iv:drop":
-        inv_finish_confirm(chat_id, force=True)
-        return
-    if data == "iv:cxo":
-        inv_cancel_ask(chat_id)
-        return
-    if data == "iv:cxd":
-        inv_cancel_do(chat_id)
-        return
-    if data == "iv:none":
-        return
-    if data.startswith("iv:c:"):
-        cat = data.split(":", 2)[2]
-        s["filter_cat"] = cat
+        items = fetch_unsold() or []
+        _lots_refresh(block=False)
+    if items:
+        s = sess(chat_id)
+        s["lots"] = items
+        s["unsold"] = items
+        s["filter_cat"] = "all"
         s["query"] = ""
         persist_sess()
-        inv_list(chat_id, 0)
+        show_item_list(chat_id, 0)
         return
-    if data.startswith("iv:pg:"):
-        try:
-            page = int(data.rsplit(":", 1)[1])
-        except ValueError:
-            page = 0
-        inv_list(chat_id, max(0, page))
-        return
-    if data.startswith("iv:it:"):
-        try:
-            row = int(data.rsplit(":", 1)[1])
-        except ValueError:
+    ui(chat_id, "подгружаю лоты…")
+
+    def work():
+        _lots_refresh(block=True)
+        got = fetch_lots(mode) or fetch_unsold() or []
+        if not got:
+            ui(chat_id, "пусто или таблица не отвечает.")
+            go_menu(chat_id)
             return
-        inv_item(chat_id, row)
-        return
-    if data.startswith("iv:ok:"):
-        try:
-            row = int(data.rsplit(":", 1)[1])
-        except ValueError:
-            return
-        inv_mark(chat_id, row, INV_OK)
-        return
-    if data.startswith("iv:no:"):
-        try:
-            row = int(data.rsplit(":", 1)[1])
-        except ValueError:
-            return
-        inv_mark(chat_id, row, INV_MISS)
-        return
-    if data.startswith("iv:fix:"):
-        parts = data.split(":")
-        if len(parts) < 4:
-            return
-        try:
-            inv_fix_card(chat_id, int(parts[2]), int(parts[3]))
-        except ValueError:
-            return
-        return
-    if data.startswith("iv:fx:"):
-        parts = data.split(":")
-        if len(parts) < 5:
-            return
-        try:
-            inv_fix_apply(chat_id, int(parts[2]), int(parts[3]), parts[4])
-        except ValueError:
-            return
-        return
-    if data.startswith("iv:mp:"):
-        parts = data.split(":")
-        if len(parts) < 4:
-            return
-        try:
-            inv_month_view(chat_id, int(parts[2]), max(0, int(parts[3])))
-        except ValueError:
-            return
-        return
-    if data.startswith("iv:h:"):
-        try:
-            session_id = int(data.rsplit(":", 1)[1])
-        except ValueError:
-            return
-        inv_month_view(chat_id, session_id, refresh=True)
-        return
+        ss = sess(chat_id)
+        ss["lots"] = got
+        ss["unsold"] = got
+        ss["filter_cat"] = "all"
+        ss["query"] = ""
+        persist_sess()
+        show_item_list(chat_id, 0)
+
+    bg(work)
+
+
+_MUT_GUARD: dict = {}
+
+
+def _mut_recent(chat_id, data, window=5.0) -> bool:
+    # страховка от двойного тапа по «записать»/«удалить»/«отменить»:
+    # повторный клик в коротком окне игнорируем
+    t = time.time()
+    last = _MUT_GUARD.get(chat_id)
+    if last and last[0] == data and t - last[1] < window:
+        return True
+    _MUT_GUARD[chat_id] = (data, t)
+    return False
 
 
 def on_callback(chat_id, cb_id, data: str, message_id=None):
-    answer_cb(cb_id)
     data = data or ""
+    if data in ("ok", "xd:yes", "un:yes") and _mut_recent(chat_id, data):
+        log("cb dedupe " + data)
+        answer_cb(cb_id, "уже обрабатываю…")
+        return
+    answer_cb(cb_id)
     log("cb " + data + " step=" + str(sess(chat_id).get("step")))
     s = sess(chat_id)
     if message_id:
@@ -3290,9 +2675,6 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
     if data == "m:sell":
         start_deal(chat_id, "sell")
         return
-    if data == "m:inv":
-        start_inventory(chat_id)
-        return
     if data == "m:cash":
         start_cash(chat_id)
         return
@@ -3304,9 +2686,6 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
         return
     if data == "m:undo":
         start_undo(chat_id)
-        return
-    if data.startswith("iv:"):
-        on_inv_callback(chat_id, data)
         return
     if data == "un:no":
         go_menu(chat_id, "ок, оставил как было.")
@@ -3340,13 +2719,13 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
             show_categories(chat_id, for_sell=False)
         else:
             if not s.get("unsold"):
-                if not load_unsold_or_fail(chat_id):
+                if not load_unsold_or_fail(chat_id, then="cats"):
                     return
             show_categories(chat_id, for_sell=True)
         return
     if data == "m:search":
         if s.get("type") == "sell" and not s.get("unsold"):
-            if not load_unsold_or_fail(chat_id):
+            if not load_unsold_or_fail(chat_id, then="search"):
                 return
         ask_search(chat_id)
         return
@@ -3367,19 +2746,17 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
             ask_amount(chat_id)
             return
         if s.get("type") == "edit" and s.get("edit_field") == "cat":
-            r = sheets_call(
-                {"action": "update", "sheet_row": s.get("edit_row"), "fields": {"category": cat}}
-            )
-            if r.get("ok"):
-                s.setdefault("edit_item", {})["category"] = cat
-                s["edit_field"] = None
-                persist_sess()
-                show_edit_item(chat_id)
-            else:
-                ui(chat_id, "не смог записать категорию.")
+            s.setdefault("edit_item", {})["category"] = cat
+            s["edit_field"] = None
+            persist_sess()
+            show_edit_item(chat_id)
+            bg(sheets_call, {"action": "update", "sheet_row": s.get("edit_row"), "fields": {"category": cat}})
             return
         if s.get("type") == "sell" and not s.get("unsold"):
-            if not load_unsold_or_fail(chat_id):
+            s["filter_cat"] = cat
+            s["query"] = s.get("query") or ""
+            persist_sess()
+            if not load_unsold_or_fail(chat_id, then="all"):
                 return
         s["filter_cat"] = cat
         s["query"] = s.get("query") or ""
@@ -3458,10 +2835,10 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
                 ui(chat_id, "напиши роль Матвея.", kb([nav_row()]))
                 return
             if code == "skip":
-                r = sheets_call({"action": "update", "sheet_row": s.get("edit_row"), "fields": {"role": ""}})
-                if r.get("ok"):
-                    s.setdefault("edit_item", {})["role"] = ""
+                s.setdefault("edit_item", {})["role"] = ""
+                persist_sess()
                 show_edit_item(chat_id)
+                bg(sheets_call, {"action": "update", "sheet_row": s.get("edit_row"), "fields": {"role": ""}})
                 return
             info = ROLE_MAP.get(code)
             full = info[0] if info else code
@@ -3469,10 +2846,10 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
             fields = {"role": full}
             if pct is not None:
                 fields["role_pct"] = pct
-            r = sheets_call({"action": "update", "sheet_row": s.get("edit_row"), "fields": fields})
-            if r.get("ok"):
-                s.setdefault("edit_item", {})["role"] = full
+            s.setdefault("edit_item", {})["role"] = full
+            persist_sess()
             show_edit_item(chat_id)
+            bg(sheets_call, {"action": "update", "sheet_row": s.get("edit_row"), "fields": fields})
             return
         if code == "other":
             s["step"] = "role_other"
@@ -3507,13 +2884,10 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
                 ui(chat_id, "напиши где продали.", kb([nav_row()]))
                 return
             name = PLACE_MAP.get(code, code)
-            r = sheets_call(
-                {"action": "update", "sheet_row": s.get("edit_row"), "fields": {"place": name}}
-            )
-            if r.get("ok"):
-                s.setdefault("edit_item", {})["place"] = name
-                persist_sess()
+            s.setdefault("edit_item", {})["place"] = name
+            persist_sess()
             show_edit_item(chat_id)
+            bg(sheets_call, {"action": "update", "sheet_row": s.get("edit_row"), "fields": {"place": name}})
             return
         if code == "other":
             s["step"] = "place_other"
@@ -3531,12 +2905,10 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
         return
     if data == "n:skip":
         if s.get("type") == "edit":
-            r = sheets_call(
-                {"action": "update", "sheet_row": s.get("edit_row"), "fields": {"note": ""}}
-            )
-            if r.get("ok"):
-                s.setdefault("edit_item", {})["note"] = ""
+            s.setdefault("edit_item", {})["note"] = ""
+            persist_sess()
             show_edit_item(chat_id)
+            bg(sheets_call, {"action": "update", "sheet_row": s.get("edit_row"), "fields": {"note": ""}})
             return
         s["note"] = ""
         persist_sess()
@@ -3641,43 +3013,46 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
         return
     if data == "xd:yes":
         it = s.get("edit_item") or {}
-        r = sheets_call(
-            {
-                "action": "delete",
-                "sheet_row": s.get("edit_row"),
-                "product": it.get("product") or "",
-                "cost": it.get("cost") or 0,
-                "sale": it.get("sale") or 0,
-            }
-        )
-        if r.get("ok"):
-            for x in r.get("reversed") or []:
-                append_deal(
-                    {
-                        "id": datetime.now().strftime("%Y%m%d%H%M%S"),
-                        "ts": datetime.now().isoformat(timespec="seconds"),
-                        "chat_id": chat_id,
-                        "type": "cash",
-                        "product": x.get("product") or it.get("product") or "",
-                        "amount": int(x.get("amount") or 0),
-                        "who": "other_in" if x.get("dir") == "in" else "other_out",
-                        "date": today_str(),
-                        "kassa_what": x.get("what") or "Отмена",
-                        "cash_dir": x.get("dir"),
-                        "comment": "отмена лота",
-                    }
-                )
-            extra = ""
-            nrev = len(r.get("reversed") or [])
-            if nrev:
-                extra = "\nкасса: сторно %s запис." % nrev
+        row = s.get("edit_row")
+        ui(chat_id, "удаляю лот…")
+        _unsold_drop_row(row)
+        _CASH["t"] = 0
+        go_menu(chat_id, "лот убрал у бота, пишу в таблицу…")
+
+        def work():
+            r = sheets_call(
+                {
+                    "action": "delete",
+                    "sheet_row": row,
+                    "product": it.get("product") or "",
+                    "cost": it.get("cost") or 0,
+                    "sale": it.get("sale") or 0,
+                }
+            )
+            if r.get("ok"):
+                for x in r.get("reversed") or []:
+                    append_deal(
+                        {
+                            "id": datetime.now().strftime("%Y%m%d%H%M%S"),
+                            "ts": datetime.now().isoformat(timespec="seconds"),
+                            "chat_id": chat_id,
+                            "type": "cash",
+                            "product": x.get("product") or it.get("product") or "",
+                            "amount": int(x.get("amount") or 0),
+                            "who": "other_in" if x.get("dir") == "in" else "other_out",
+                            "date": today_str(),
+                            "kassa_what": x.get("what") or "Отмена",
+                            "cash_dir": x.get("dir"),
+                            "comment": "отмена лота",
+                        }
+                    )
+                nrev = len(r.get("reversed") or [])
+                extra = (" касса: сторно %s запис." % nrev) if nrev else ""
+                send(chat_id, "лот удалён из таблицы." + extra, reply_kb())
             else:
-                extra = "\nпо кассе движений с этим товаром не нашёл — глянь Кассу глазами."
-            _CASH["t"] = 0
-            go_menu(chat_id, "лот удалил из таблицы." + extra)
-        else:
-            ui(chat_id, "не смог удалить.")
-            go_menu(chat_id)
+                send(chat_id, "у бота убрал, таблица не приняла — глянь строку глазами.", reply_kb())
+
+        bg(work)
         return
     if data == "ok":
         commit(chat_id)
@@ -3732,13 +3107,15 @@ def setup_bot():
                 {"command": "start", "description": "Меню"},
                 {"command": "edit", "description": "Изменить лот"},
                 {"command": "balance", "description": "Касса, сколько на руках"},
-                {"command": "inv", "description": "Инвентаризация"},
                 {"command": "undo", "description": "Отменить последнее действие"},
                 {"command": "cancel", "description": "Отменить ввод"},
             ]
         },
     )
     log("sheets setup deferred to keepwarm")
+
+
+_SEEN_UPDATES: set = set()
 
 
 def loop():
@@ -3766,7 +3143,14 @@ def loop():
             time.sleep(2)
             continue
         for u in res.get("result") or []:
-            offset = u["update_id"] + 1
+            uid = u["update_id"]
+            offset = uid + 1
+            if uid in _SEEN_UPDATES:
+                log("skip dup update %s" % uid)
+                continue
+            _SEEN_UPDATES.add(uid)
+            if len(_SEEN_UPDATES) > 5000:
+                _SEEN_UPDATES.clear()
             try:
                 handle_update(u)
             except Exception:
