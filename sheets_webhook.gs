@@ -41,6 +41,7 @@ function doPost(e) {
   var body = {};
   try { body = JSON.parse((e && e.postData && e.postData.contents) || '{}'); }
   catch (err) { return json_({ok: false, error: 'bad json'}); }
+  if (body.target === 'lich') return lichRoute_(body);
   if (body.secret !== WEBHOOK_SECRET) return json_({ok: false, error: 'forbidden'});
 
   var action = body.action || 'write';
@@ -724,4 +725,343 @@ function invUpdate_(ss, b) {
     }
   }
   return {ok: false, error: 'not found'};
+}
+
+/* ===== ЛИЧНЫЙ УЧЕТ (маршрут target:'lich', отдельный секрет) =====
+   Таблица «Личный учет»: Учет (A Дата, B Месяц, C Товар, D Категория, E Закуп,
+   F Продажа, G Доставка, H Расходник, I Прибыль, J Примечание; данные с 2),
+   Касса (A Дата, B Операция, C Приход, D Расход, E Комментарий; данные с 2). */
+var LICH_SECRET = '1af3e966f8d5b75b8a7329663d90d137';
+var LICH_SS_ID = '1iUaH0maYwqr3yfVbvD2G06nVj1iQ1yplc4-EgU1i9KM';
+var LCOL = {DATE: 1, MONTH: 2, PRODUCT: 3, CAT: 4, COST: 5, SALE: 6, DELIV: 7, CONS: 8, PROFIT: 9, NOTE: 10};
+
+function lichRoute_(body) {
+  if (body.lich_secret !== LICH_SECRET) return json_({ok: false, error: 'forbidden'});
+  var action = body.action || 'write';
+  if (action === 'ping') return json_({ok: true, pong: true, lich: true});
+  var ss = SpreadsheetApp.openById(LICH_SS_ID);
+  var acc = ss.getSheetByName('Учет') || lichAccSheet_(ss);
+  var kassa = ss.getSheetByName('Касса') || lichKassaSheet_(ss);
+
+  if (action === 'balance') { var c0 = lichCacheGet_('l_balance'); if (c0) return c0; return lichCachePut_('l_balance', lichBalance_(kassa)); }
+  if (action === 'unsold') { var c1 = lichCacheGet_('l_unsold'); if (c1) return c1; return lichCachePut_('l_unsold', {ok: true, items: lichUnsold_(acc)}); }
+  if (action === 'lots') { var c2 = lichCacheGet_('l_lots'); if (c2) return c2; return lichCachePut_('l_lots', {ok: true, items: lichLots_(acc)}); }
+  if (action === 'lot') return json_({ok: true, item: lichLot_(acc, Number(body.row || body.sheet_row || 0))});
+  if (action === 'summary') { var c3 = lichCacheGet_('l_summary'); if (c3) return c3; return lichCachePut_('l_summary', {ok: true, months: lichSummary_(acc, kassa)}); }
+
+  if (action === 'kassa_rows') return json_({ok: true, rows: lichKassaRows_(kassa)});
+  if (action === 'kassa_del') {
+    var kdr = Number(body.row || 0);
+    if (!kdr || kdr < 2) return json_({ok: false, error: 'bad row'});
+    kassa.deleteRow(kdr);
+    lichCacheDrop_();
+    return json_({ok: true});
+  }
+
+  if (action === 'update') { lichUpdateRow_(acc, body); lichCacheDrop_(); return json_({ok: true}); }
+  if (action === 'delete') {
+    var item = lichLot_(acc, Number(body.row || 0));
+    if (!item && body.product) item = {product: body.product, cost: Number(body.cost || 0), sale: Number(body.sale || 0)};
+    lichReverseKassa_(kassa, item);
+    if (body.row) lichClearRow_(acc, Number(body.row));
+    lichCacheDrop_();
+    return json_({ok: true});
+  }
+
+  var written = 0;
+  if (body.cash_dir === 'in' || body.cash_dir === 'out') lichAppendKassa_(kassa, body);
+  if (body.type === 'buy') written = lichAppendBuy_(acc, kassa, body);
+  if (body.type === 'sell') written = lichMarkSold_(acc, kassa, body);
+  lichCacheDrop_();
+  return json_({ok: true, sheet_row: written});
+}
+
+function lichCacheGet_(key) {
+  try { var hit = cache_().get(key); if (hit) return ContentService.createTextOutput(hit).setMimeType(ContentService.MimeType.JSON); } catch (e) {}
+  return null;
+}
+function lichCachePut_(key, obj) {
+  try { cache_().put(key, JSON.stringify(obj), 15); } catch (e) {}
+  return json_(obj);
+}
+function lichCacheDrop_() {
+  try { cache_().removeAll(['l_balance', 'l_unsold', 'l_lots', 'l_summary']); } catch (e) {}
+}
+
+function lichAccSheet_(ss) {
+  var sh = ss.insertSheet('Учет');
+  sh.getRange(1, 1, 1, 10).setValues([['Дата', 'Месяц', 'Товар', 'Категория', 'Закуп', 'Продажа', 'Доставка', 'Расходник', 'Прибыль', 'Примечание']]).setFontWeight('bold');
+  sh.setFrozenRows(1);
+  return sh;
+}
+function lichKassaSheet_(ss) {
+  var sh = ss.insertSheet('Касса');
+  sh.getRange(1, 1, 1, 5).setValues([['Дата', 'Операция', 'Приход', 'Расход', 'Комментарий']]).setFontWeight('bold');
+  sh.setFrozenRows(1);
+  return sh;
+}
+function lichDate_(s) {
+  var p = String(s || '').split('.');
+  if (p.length === 3) return new Date(Number(p[2]), Number(p[1]) - 1, Number(p[0]));
+  return s || '';
+}
+function lichFmtDate_(v) {
+  if (Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v.getTime())) {
+    var d = v.getDate(), m = v.getMonth() + 1, y = v.getFullYear();
+    return ('0' + d).slice(-2) + '.' + ('0' + m).slice(-2) + '.' + y;
+  }
+  return v ? String(v) : '';
+}
+function lichMonth_(d) {
+  if (Object.prototype.toString.call(d) !== '[object Date]' || isNaN(d.getTime())) return '';
+  return MONTHS[d.getMonth()] || '';
+}
+function lichNextRow_(sh, col, start) {
+  var max = sh.getMaxRows();
+  var last = start - 1;
+  var from = start;
+  var chunk = 250;
+  while (from <= max) {
+    var n = Math.min(chunk, max - from + 1);
+    var vals = sh.getRange(from, col, n, 1).getValues();
+    var empty = true;
+    for (var i = 0; i < vals.length; i++) {
+      if (vals[i][0] !== '' && vals[i][0] != null) { last = from + i; empty = false; }
+    }
+    if (empty && from > start) break;
+    from += chunk;
+  }
+  return last + 1;
+}
+function lichNum_(v) { if (v === '' || v == null) return 0; var n = Number(v); return isNaN(n) ? 0 : n; }
+
+function lichBalance_(kassa) {
+  var inn = 0, out = 0, recent = [];
+  var last = lichNextRow_(kassa, 2, 2) - 1;
+  if (last >= 2) {
+    var vals = kassa.getRange(2, 1, last - 1, 5).getValues();
+    for (var i = 0; i < vals.length; i++) { inn += lichNum_(vals[i][2]); out += lichNum_(vals[i][3]); }
+    for (var j = vals.length - 1; j >= 0 && recent.length < 8; j--) {
+      var cin = lichNum_(vals[j][2]), cout = lichNum_(vals[j][3]);
+      if (!cin && !cout && !vals[j][1]) continue;
+      recent.push({date: lichFmtDate_(vals[j][0]), what: String(vals[j][1] || ''), inn: cin, out: cout, comment: String(vals[j][4] || '')});
+    }
+  }
+  return {ok: true, start: 0, inn: inn, out: out, hand: inn - out, computed: inn - out, recent: recent};
+}
+
+function lichRowItem_(row, vals) {
+  var product = vals[2];
+  if (!product) return null;
+  var sold = !(vals[5] === '' || vals[5] == null);
+  return {
+    row: row,
+    date: lichFmtDate_(vals[0]),
+    month: String(vals[1] || ''),
+    product: String(product),
+    category: String(vals[3] || 'Другое'),
+    cost: lichNum_(vals[4]),
+    sale: lichNum_(vals[5]),
+    delivery: lichNum_(vals[6]),
+    consumable: lichNum_(vals[7]),
+    profit: sold ? lichNum_(vals[5]) - lichNum_(vals[4]) - lichNum_(vals[6]) - lichNum_(vals[7]) : 0,
+    note: String(vals[9] || ''),
+    sold: sold
+  };
+}
+function lichLastRow_(sh) { return Math.max(1, lichNextRow_(sh, LCOL.PRODUCT, 2) - 1); }
+
+function lichUnsold_(sh) {
+  var last = lichLastRow_(sh);
+  if (last < 2) return [];
+  var vals = sh.getRange(2, 1, last - 1, 10).getValues();
+  var items = [];
+  for (var i = 0; i < vals.length; i++) {
+    if (vals[i][5] !== '' && vals[i][5] != null) continue;
+    var it = lichRowItem_(2 + i, vals[i]);
+    if (it) items.push(it);
+  }
+  return items;
+}
+function lichLots_(sh) {
+  var last = lichLastRow_(sh);
+  if (last < 2) return [];
+  var vals = sh.getRange(2, 1, last - 1, 10).getValues();
+  var items = [];
+  for (var i = 0; i < vals.length; i++) {
+    var it = lichRowItem_(2 + i, vals[i]);
+    if (it) items.push(it);
+  }
+  items.reverse();
+  if (items.length > 80) items = items.slice(0, 80);
+  return items;
+}
+function lichLot_(sh, row) {
+  if (!sh || !row || row < 2) return null;
+  var vals = sh.getRange(row, 1, 1, 10).getValues()[0];
+  return lichRowItem_(row, vals);
+}
+
+function lichAppendKassa_(sh, b) {
+  var row = lichNextRow_(sh, 2, 2);
+  if (row < 2) row = 2;
+  var d = lichDate_(b.date);
+  sh.getRange(row, 1).setValue(d).setNumberFormat('dd.mm.yyyy');
+  sh.getRange(row, 2).setValue(b.kassa_what || '');
+  if (b.cash_dir === 'in') sh.getRange(row, 3).setValue(Number(b.amount || 0));
+  if (b.cash_dir === 'out') sh.getRange(row, 4).setValue(Number(b.amount || 0));
+  var bits = [];
+  if (b.product) bits.push(b.product);
+  if (b.note) bits.push(b.note);
+  if (!bits.length && b.comment) bits.push(b.comment);
+  sh.getRange(row, 5).setValue(bits.join(' · '));
+}
+function lichAppendBuy_(sh, kassa, b) {
+  var row = lichNextRow_(sh, LCOL.PRODUCT, 2);
+  if (row < 2) row = 2;
+  var d = lichDate_(b.date);
+  sh.getRange(row, LCOL.DATE).setValue(d).setNumberFormat('dd.mm.yyyy');
+  sh.getRange(row, LCOL.MONTH).setValue(lichMonth_(d));
+  sh.getRange(row, LCOL.PRODUCT).setValue(b.product || '');
+  sh.getRange(row, LCOL.CAT).setValue(b.category || 'Другое');
+  sh.getRange(row, LCOL.COST).setValue(Number(b.amount || 0));
+  if (b.note) sh.getRange(row, LCOL.NOTE).setValue(b.note);
+  if (Number(b.amount || 0) > 0) {
+    lichAppendKassa_(kassa, {date: b.date, kassa_what: 'Закуп', cash_dir: 'out', amount: b.amount, product: b.product, note: b.note});
+  }
+  return row;
+}
+function lichMarkSold_(sh, kassa, b) {
+  var row = Number(b.sheet_row || b.row || 0);
+  if (!row || row < 2) return 0;
+  sh.getRange(row, LCOL.SALE).setValue(Number(b.amount || 0));
+  if (b.delivery != null && b.delivery !== '') sh.getRange(row, LCOL.DELIV).setValue(Number(b.delivery));
+  if (b.consumable != null && b.consumable !== '') sh.getRange(row, LCOL.CONS).setValue(Number(b.consumable));
+  if (b.note) sh.getRange(row, LCOL.NOTE).setValue(b.note);
+  // прибыль пишем числом (формулы ломаются о локаль таблицы)
+  lichRecalcProfit_(sh, row);
+  if (Number(b.amount || 0) > 0) {
+    lichAppendKassa_(kassa, {date: b.date, kassa_what: 'Продажа', cash_dir: 'in', amount: b.amount, product: b.product, note: b.note});
+  }
+  return row;
+}
+function lichRecalcProfit_(sh, row) {
+  var vals = sh.getRange(row, LCOL.COST, 1, 5).getValues()[0];
+  if (vals[1] === '' || vals[1] == null) { sh.getRange(row, LCOL.PROFIT).clearContent(); return; }
+  sh.getRange(row, LCOL.PROFIT).setValue(lichNum_(vals[1]) - lichNum_(vals[0]) - lichNum_(vals[2]) - lichNum_(vals[3]));
+}
+function lichUpdateRow_(sh, b) {
+  var row = Number(b.row || b.sheet_row || 0);
+  if (!row || row < 2) return;
+  var f = b.fields || b;
+  if (f.product != null && f.product !== '') sh.getRange(row, LCOL.PRODUCT).setValue(f.product);
+  if (f.cost != null && f.cost !== '') sh.getRange(row, LCOL.COST).setValue(Number(f.cost));
+  if (f.sale != null && f.sale !== '') sh.getRange(row, LCOL.SALE).setValue(Number(f.sale));
+  if (f.clear_sale) sh.getRange(row, LCOL.SALE).clearContent();
+  if (f.category != null && f.category !== '') sh.getRange(row, LCOL.CAT).setValue(f.category);
+  if (f.note != null) sh.getRange(row, LCOL.NOTE).setValue(f.note);
+  if (f.delivery != null && f.delivery !== '') sh.getRange(row, LCOL.DELIV).setValue(Number(f.delivery));
+  if (f.consumable != null && f.consumable !== '') sh.getRange(row, LCOL.CONS).setValue(Number(f.consumable));
+  if (f.buy_date) {
+    var d = lichDate_(f.buy_date);
+    sh.getRange(row, LCOL.DATE).setValue(d).setNumberFormat('dd.mm.yyyy');
+    sh.getRange(row, LCOL.MONTH).setValue(lichMonth_(d));
+  }
+  if (f.cost != null || f.sale != null || f.delivery != null || f.consumable != null || f.clear_sale) {
+    lichRecalcProfit_(sh, row);
+  }
+}
+function lichClearRow_(sh, row) {
+  if (!sh || !row || row < 2) return;
+  sh.getRange(row, 1, 1, 10).clearContent();
+}
+function lichKassaRows_(sh) {
+  var last = lichNextRow_(sh, 2, 2) - 1;
+  if (last < 2) return [];
+  var vals = sh.getRange(2, 1, last - 1, 5).getValues();
+  var out = [];
+  for (var i = 0; i < vals.length; i++) {
+    if (!vals[i][1] && !vals[i][2] && !vals[i][3]) continue;
+    out.push({
+      row: 2 + i,
+      date: lichFmtDate_(vals[i][0]),
+      what: String(vals[i][1] || ''),
+      inn: lichNum_(vals[i][2]),
+      out: lichNum_(vals[i][3]),
+      comment: String(vals[i][4] || '')
+    });
+  }
+  return out;
+}
+function lichReverseKassa_(kassa, item) {
+  if (!item || !item.product) return;
+  var product = String(item.product);
+  var last = lichNextRow_(kassa, 2, 2) - 1;
+  if (last < 2) return;
+  var vals = kassa.getRange(2, 1, last - 1, 5).getValues();
+  var today = new Date();
+  var plan = [];
+  for (var i = 0; i < vals.length; i++) {
+    var what = String(vals[i][1] || ''), comment = String(vals[i][4] || '');
+    if (what.indexOf('Отмена') >= 0) continue;
+    if (comment.indexOf(product) < 0) continue;
+    var cin = lichNum_(vals[i][2]), cout = lichNum_(vals[i][3]);
+    if (cout > 0) plan.push({dir: 'in', amount: cout, what: 'Отмена закупа'});
+    if (cin > 0) plan.push({dir: 'out', amount: cin, what: 'Отмена продажи'});
+  }
+  for (var j = 0; j < plan.length; j++) {
+    var p = plan[j];
+    var nr = lichNextRow_(kassa, 2, 2);
+    if (nr < 2) nr = 2;
+    kassa.getRange(nr, 1).setValue(today).setNumberFormat('dd.mm.yyyy');
+    kassa.getRange(nr, 2).setValue(p.what);
+    if (p.dir === 'in') kassa.getRange(nr, 3).setValue(p.amount);
+    if (p.dir === 'out') kassa.getRange(nr, 4).setValue(p.amount);
+    kassa.getRange(nr, 5).setValue(product);
+  }
+}
+function lichSummary_(acc, kassa) {
+  var last = lichLastRow_(acc);
+  var accBy = {};
+  if (last >= 2) {
+    var vals = acc.getRange(2, 1, last - 1, 10).getValues();
+    for (var i = 0; i < vals.length; i++) {
+      if (!vals[i][2]) continue;
+      var m = String(vals[i][1] || lichMonth_(vals[i][0]) || '—');
+      var s = accBy[m] = accBy[m] || {month: m, count: 0, sold: 0, buy: 0, sale: 0, profit: 0};
+      s.count++;
+      s.buy += lichNum_(vals[i][4]);
+      if (vals[i][5] !== '' && vals[i][5] != null) {
+        s.sold++;
+        s.sale += lichNum_(vals[i][5]);
+        s.profit += lichNum_(vals[i][8]);
+      }
+    }
+  }
+  var kBy = {};
+  var klast = lichNextRow_(kassa, 2, 2) - 1;
+  if (klast >= 2) {
+    var kv = kassa.getRange(2, 1, klast - 1, 4).getValues();
+    for (var j = 0; j < kv.length; j++) {
+      var km = String(lichMonth_(kv[j][0]) || '—');
+      var ks = kBy[km] = kBy[km] || {month: km, inn: 0, out: 0};
+      ks.inn += lichNum_(kv[j][2]);
+      ks.out += lichNum_(kv[j][3]);
+    }
+  }
+  var out = [];
+  for (var key in accBy) if (accBy.hasOwnProperty(key)) {
+    var o = accBy[key];
+    o.inn = (kBy[key] && kBy[key].inn) || 0;
+    o.out = (kBy[key] && kBy[key].out) || 0;
+    out.push(o);
+  }
+  var order = {};
+  MONTHS.forEach(function (m, idx) { order[m] = idx; });
+  out.sort(function (a, b) {
+    var ia = order[a.month] != null ? order[a.month] : -1;
+    var ib = order[b.month] != null ? order[b.month] : -1;
+    return ia - ib;
+  });
+  return out.slice(-12);
 }
