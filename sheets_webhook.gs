@@ -741,6 +741,15 @@ function lichRoute_(body) {
   if (action === 'ping') return json_({ok: true, pong: true, lich: true});
   if (action === 'restyle') return lichRestyle_();
   if (action === 'rebuild') return lichRebuild_();
+  if (action === 'import') return lichImport_(body);
+  if (action === 'clear_range') {
+    var a = Number(body.row1 || 0), b = Number(body.row2 || 0);
+    var css = SpreadsheetApp.openById(LICH_SS_ID).getSheetByName('Учет');
+    if (!css || a < 9 || b < a || b > 10000) return json_({ok: false, error: 'bad range'});
+    css.getRange(a, 1, b - a + 1, 10).clearContent();
+    lichCacheDrop_();
+    return json_({ok: true, cleared: b - a + 1});
+  }
   var ss = SpreadsheetApp.openById(LICH_SS_ID);
   var acc = ss.getSheetByName('Учет') || lichAccSheet_(ss);
   var kassa = ss.getSheetByName('Касса') || lichKassaSheet_(ss);
@@ -1143,4 +1152,42 @@ function lichRebuild_() {
   lichKassaSheet_(lich);
   lichRestyle_();
   return json_({ok: true});
+}
+
+// импорт строк [[Дата,Месяц,Товар,Категория,Закуп,Продажа,Доставка,Расходник,Прибыль,Примечание],...]
+// sheet: 'Учет' (дописать с первой пустой) или 'Архив 2025' (создать при необходимости)
+function lichImport_(body) {
+  var rows = body.rows || [];
+  if (!rows.length) return json_({ok: false, error: 'no rows'});
+  var ss = SpreadsheetApp.openById(LICH_SS_ID);
+  var sh, want = String(body.sheet || 'Учет');
+  if (want === 'Учет') {
+    sh = ss.getSheetByName('Учет');
+  } else {
+    sh = ss.getSheetByName(want);
+    if (!sh) {
+      sh = ss.insertSheet(want);
+      sh.setTabColor('#8aa07a');
+      sh.getRange('A1').setValue('АРХИВ · ' + want.replace('Архив ', '')).setFontWeight('bold').setFontSize(16).setFontFamily('Syne');
+      sh.getRange('A2').setValue('импорт из excel, в боте не участвует').setFontColor('#8aa07a').setFontSize(10);
+      sh.getRange(8, 1, 1, 10).setValues([['Дата', 'Месяц', 'Товар', 'Категория', 'Закуп', 'Продажа', 'Доставка', 'Расходник', 'Прибыль', 'Примечание']])
+        .setFontWeight('bold').setBackground('#c8ff00').setFontColor('#071000');
+      sh.setFrozenRows(8);
+      sh.setColumnWidth(1, 100);
+      sh.setColumnWidth(2, 90);
+      sh.setColumnWidth(3, 250);
+      for (var c = 4; c <= 10; c++) sh.setColumnWidth(c, 100);
+    }
+  }
+  if (!sh) return json_({ok: false, error: 'no sheet'});
+  var start = 9;
+  var have = sh.getRange(9, 1, Math.max(1, sh.getLastRow() - 8), 10).getValues();
+  for (var i = have.length - 1; i >= 0; i--) {
+    var nonempty = false;
+    for (var j = 0; j < 10; j++) if (have[i][j] !== '' && have[i][j] !== null) { nonempty = true; break; }
+    if (nonempty) { start = 9 + i + 1; break; }
+  }
+  sh.getRange(start, 1, rows.length, 10).setValues(rows);
+  lichCacheDrop_();
+  return json_({ok: true, sheet: want, start: start, written: rows.length});
 }
