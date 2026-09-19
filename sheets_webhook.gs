@@ -739,6 +739,8 @@ function lichRoute_(body) {
   if (body.lich_secret !== LICH_SECRET) return json_({ok: false, error: 'forbidden'});
   var action = body.action || 'write';
   if (action === 'ping') return json_({ok: true, pong: true, lich: true});
+  if (action === 'restyle') return lichRestyle_();
+  if (action === 'rebuild') return lichRebuild_();
   var ss = SpreadsheetApp.openById(LICH_SS_ID);
   var acc = ss.getSheetByName('Учет') || lichAccSheet_(ss);
   var kassa = ss.getSheetByName('Касса') || lichKassaSheet_(ss);
@@ -790,14 +792,14 @@ function lichCacheDrop_() {
 
 function lichAccSheet_(ss) {
   var sh = ss.insertSheet('Учет');
-  sh.getRange(1, 1, 1, 10).setValues([['Дата', 'Месяц', 'Товар', 'Категория', 'Закуп', 'Продажа', 'Доставка', 'Расходник', 'Прибыль', 'Примечание']]).setFontWeight('bold');
-  sh.setFrozenRows(1);
+  sh.getRange(8, 1, 1, 10).setValues([['Дата', 'Месяц', 'Товар', 'Категория', 'Закуп', 'Продажа', 'Доставка', 'Расходник', 'Прибыль', 'Примечание']]).setFontWeight('bold');
+  sh.setFrozenRows(8);
   return sh;
 }
 function lichKassaSheet_(ss) {
   var sh = ss.insertSheet('Касса');
-  sh.getRange(1, 1, 1, 5).setValues([['Дата', 'Операция', 'Приход', 'Расход', 'Комментарий']]).setFontWeight('bold');
-  sh.setFrozenRows(1);
+  sh.getRange(8, 1, 1, 5).setValues([['Дата', 'Операция', 'Приход', 'Расход', 'Комментарий']]).setFontWeight('bold');
+  sh.setFrozenRows(8);
   return sh;
 }
 function lichDate_(s) {
@@ -838,8 +840,8 @@ function lichNum_(v) { if (v === '' || v == null) return 0; var n = Number(v); r
 function lichBalance_(kassa) {
   var inn = 0, out = 0, recent = [];
   var last = lichNextRow_(kassa, 2, 2) - 1;
-  if (last >= 2) {
-    var vals = kassa.getRange(2, 1, last - 1, 5).getValues();
+  if (last >= 9) {
+    var vals = kassa.getRange(9, 1, last - 1, 5).getValues();
     for (var i = 0; i < vals.length; i++) { inn += lichNum_(vals[i][2]); out += lichNum_(vals[i][3]); }
     for (var j = vals.length - 1; j >= 0 && recent.length < 8; j--) {
       var cin = lichNum_(vals[j][2]), cout = lichNum_(vals[j][3]);
@@ -869,27 +871,27 @@ function lichRowItem_(row, vals) {
     sold: sold
   };
 }
-function lichLastRow_(sh) { return Math.max(1, lichNextRow_(sh, LCOL.PRODUCT, 2) - 1); }
+function lichLastRow_(sh) { return Math.max(1, lichNextRow_(sh, LCOL.PRODUCT, 9) - 1); }
 
 function lichUnsold_(sh) {
   var last = lichLastRow_(sh);
-  if (last < 2) return [];
-  var vals = sh.getRange(2, 1, last - 1, 10).getValues();
+  if (last < 9) return [];
+  var vals = sh.getRange(9, 1, last - 1, 10).getValues();
   var items = [];
   for (var i = 0; i < vals.length; i++) {
     if (vals[i][5] !== '' && vals[i][5] != null) continue;
-    var it = lichRowItem_(2 + i, vals[i]);
+    var it = lichRowItem_(9 + i, vals[i]);
     if (it) items.push(it);
   }
   return items;
 }
 function lichLots_(sh) {
   var last = lichLastRow_(sh);
-  if (last < 2) return [];
-  var vals = sh.getRange(2, 1, last - 1, 10).getValues();
+  if (last < 9) return [];
+  var vals = sh.getRange(9, 1, last - 1, 10).getValues();
   var items = [];
   for (var i = 0; i < vals.length; i++) {
-    var it = lichRowItem_(2 + i, vals[i]);
+    var it = lichRowItem_(9 + i, vals[i]);
     if (it) items.push(it);
   }
   items.reverse();
@@ -897,14 +899,14 @@ function lichLots_(sh) {
   return items;
 }
 function lichLot_(sh, row) {
-  if (!sh || !row || row < 2) return null;
+  if (!sh || !row || row < 9) return null;
   var vals = sh.getRange(row, 1, 1, 10).getValues()[0];
   return lichRowItem_(row, vals);
 }
 
 function lichAppendKassa_(sh, b) {
-  var row = lichNextRow_(sh, 2, 2);
-  if (row < 2) row = 2;
+  var row = lichNextRow_(sh, 2, 9);
+  if (row < 9) row = 9;
   var d = lichDate_(b.date);
   sh.getRange(row, 1).setValue(d).setNumberFormat('dd.mm.yyyy');
   sh.getRange(row, 2).setValue(b.kassa_what || '');
@@ -917,8 +919,8 @@ function lichAppendKassa_(sh, b) {
   sh.getRange(row, 5).setValue(bits.join(' · '));
 }
 function lichAppendBuy_(sh, kassa, b) {
-  var row = lichNextRow_(sh, LCOL.PRODUCT, 2);
-  if (row < 2) row = 2;
+  var row = lichNextRow_(sh, LCOL.PRODUCT, 9);
+  if (row < 9) row = 9;
   var d = lichDate_(b.date);
   sh.getRange(row, LCOL.DATE).setValue(d).setNumberFormat('dd.mm.yyyy');
   sh.getRange(row, LCOL.MONTH).setValue(lichMonth_(d));
@@ -933,7 +935,7 @@ function lichAppendBuy_(sh, kassa, b) {
 }
 function lichMarkSold_(sh, kassa, b) {
   var row = Number(b.sheet_row || b.row || 0);
-  if (!row || row < 2) return 0;
+  if (!row || row < 9) return 0;
   sh.getRange(row, LCOL.SALE).setValue(Number(b.amount || 0));
   if (b.delivery != null && b.delivery !== '') sh.getRange(row, LCOL.DELIV).setValue(Number(b.delivery));
   if (b.consumable != null && b.consumable !== '') sh.getRange(row, LCOL.CONS).setValue(Number(b.consumable));
@@ -952,7 +954,7 @@ function lichRecalcProfit_(sh, row) {
 }
 function lichUpdateRow_(sh, b) {
   var row = Number(b.row || b.sheet_row || 0);
-  if (!row || row < 2) return;
+  if (!row || row < 9) return;
   var f = b.fields || b;
   if (f.product != null && f.product !== '') sh.getRange(row, LCOL.PRODUCT).setValue(f.product);
   if (f.cost != null && f.cost !== '') sh.getRange(row, LCOL.COST).setValue(Number(f.cost));
@@ -972,18 +974,18 @@ function lichUpdateRow_(sh, b) {
   }
 }
 function lichClearRow_(sh, row) {
-  if (!sh || !row || row < 2) return;
+  if (!sh || !row || row < 9) return;
   sh.getRange(row, 1, 1, 10).clearContent();
 }
 function lichKassaRows_(sh) {
-  var last = lichNextRow_(sh, 2, 2) - 1;
-  if (last < 2) return [];
-  var vals = sh.getRange(2, 1, last - 1, 5).getValues();
+  var last = lichNextRow_(sh, 2, 9) - 1;
+  if (last < 9) return [];
+  var vals = sh.getRange(9, 1, last - 1, 5).getValues();
   var out = [];
   for (var i = 0; i < vals.length; i++) {
     if (!vals[i][1] && !vals[i][2] && !vals[i][3]) continue;
     out.push({
-      row: 2 + i,
+      row: 9 + i,
       date: lichFmtDate_(vals[i][0]),
       what: String(vals[i][1] || ''),
       inn: lichNum_(vals[i][2]),
@@ -997,8 +999,8 @@ function lichReverseKassa_(kassa, item) {
   if (!item || !item.product) return;
   var product = String(item.product);
   var last = lichNextRow_(kassa, 2, 2) - 1;
-  if (last < 2) return;
-  var vals = kassa.getRange(2, 1, last - 1, 5).getValues();
+  if (last < 9) return;
+  var vals = kassa.getRange(9, 1, last - 1, 5).getValues();
   var today = new Date();
   var plan = [];
   for (var i = 0; i < vals.length; i++) {
@@ -1023,8 +1025,8 @@ function lichReverseKassa_(kassa, item) {
 function lichSummary_(acc, kassa) {
   var last = lichLastRow_(acc);
   var accBy = {};
-  if (last >= 2) {
-    var vals = acc.getRange(2, 1, last - 1, 10).getValues();
+  if (last >= 9) {
+    var vals = acc.getRange(9, 1, last - 1, 10).getValues();
     for (var i = 0; i < vals.length; i++) {
       if (!vals[i][2]) continue;
       var m = String(vals[i][1] || lichMonth_(vals[i][0]) || '—');
@@ -1064,4 +1066,81 @@ function lichSummary_(acc, kassa) {
     return ia - ib;
   });
   return out.slice(-12);
+}
+
+function lichRestyle_() {
+  var lich = SpreadsheetApp.openById(LICH_SS_ID);
+  var acc = lich.getSheetByName('Учет');
+  var kas = lich.getSheetByName('Касса');
+  if (!acc || !kas) return json_({ok: false, error: 'no sheets'});
+  try {
+    var ss = SpreadsheetApp.getActive();
+    var sales = ss.getSheetByName('Продажи');
+    var mk = ss.getSheetByName('Касса');
+    if (String(acc.getRange('A8').getValue()) !== 'Дата') acc.insertRowsBefore(1, 7);
+    if (String(kas.getRange('A8').getValue()) !== 'Дата') kas.insertRowsBefore(1, 7);
+    acc.getRange('A9:J300').clearContent();
+    kas.getRange('A9:E300').clearContent();
+    acc.getRange('A8:J8').setValues([['Дата', 'Месяц', 'Товар', 'Категория', 'Закуп', 'Продажа', 'Доставка', 'Расходник', 'Прибыль', 'Примечание']]).setFontWeight('bold');
+    kas.getRange('A8:E8').setValues([['Дата', 'Операция', 'Приход', 'Расход', 'Комментарий']]).setFontWeight('bold');
+    lichCopyFmt_(sales.getRange(1, 1, 8, 10), acc.getRange(1, 1, 8, 10));
+    lichCopyFmt_(mk.getRange(1, 1, 8, 5), kas.getRange(1, 1, 8, 5));
+    lichCopyFmt_(sales.getRange(9, 1, 6, 10), acc.getRange(9, 1, 292, 10));
+    lichCopyFmt_(mk.getRange(9, 1, 6, 5), kas.getRange(9, 1, 292, 5));
+    for (var c = 1; c <= 10; c++) acc.setColumnWidth(c, sales.getColumnWidth(c));
+    for (var c = 1; c <= 5; c++) kas.setColumnWidth(c, mk.getColumnWidth(c));
+    for (var r = 1; r <= 8; r++) {
+      acc.setRowHeight(r, sales.getRowHeight(r));
+      kas.setRowHeight(r, mk.getRowHeight(r));
+    }
+    acc.setFrozenRows(8);
+    kas.setFrozenRows(8);
+    try { acc.setTabColor(sales.getTabColor()); } catch (e1) {}
+    try { kas.setTabColor(mk.getTabColor()); } catch (e2) {}
+    acc.getRange('A1').setValue('Личный учет');
+    kas.getRange('A1').setValue('Касса');
+    return json_({ok: true});
+  } catch (e3) {
+    return json_({ok: false, error: String(e3)});
+  }
+}
+
+function lichTile_(arr, R, C) {
+  var sr = arr.length, sc = arr[0].length, out = [];
+  for (var r = 0; r < R; r++) {
+    var line = [];
+    for (var c = 0; c < C; c++) line.push(arr[r % sr][c % sc]);
+    out.push(line);
+  }
+  return out;
+}
+
+function lichCopyFmt_(src, dst) {
+  var R = dst.getNumRows(), C = dst.getNumColumns();
+  dst.setFontFamilies(lichTile_(src.getFontFamilies(), R, C))
+     .setFontSizes(lichTile_(src.getFontSizes(), R, C))
+     .setFontWeights(lichTile_(src.getFontWeights(), R, C))
+     .setFontStyles(lichTile_(src.getFontStyles(), R, C))
+     .setFontColors(lichTile_(src.getFontColors(), R, C))
+     .setBackgrounds(lichTile_(src.getBackgrounds(), R, C))
+     .setHorizontalAlignments(lichTile_(src.getHorizontalAlignments(), R, C))
+     .setVerticalAlignments(lichTile_(src.getVerticalAlignments(), R, C))
+     .setNumberFormats(lichTile_(src.getNumberFormats(), R, C));
+  try {
+    var tl = src.getCell(1, 1);
+    var bc = tl.getBottomBorderColor() || tl.getLeftBorderColor() || tl.getRightBorderColor() || tl.getTopBorderColor();
+    if (bc) dst.setBorder(true, true, true, true, null, null, bc, SpreadsheetApp.BorderStyle.SOLID);
+  } catch (e) {}
+}
+
+function lichRebuild_() {
+  var lich = SpreadsheetApp.openById(LICH_SS_ID);
+  var a = lich.getSheetByName('Учет');
+  if (a) lich.deleteSheet(a);
+  var k = lich.getSheetByName('Касса');
+  if (k) lich.deleteSheet(k);
+  lichAccSheet_(lich);
+  lichKassaSheet_(lich);
+  lichRestyle_();
+  return json_({ok: true});
 }
