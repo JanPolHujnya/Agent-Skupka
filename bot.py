@@ -556,10 +556,11 @@ def fetch_balance(force=False) -> dict:
     if cached:
         # локальная оценка (таблица не ответила) живёт 8 с и потом
         # перепроверяется — лист мог ожить; кэш таблицы не стареет до записи
-        ttl = 8 if cached.get("source") == "local" else 25
+        # локальная оценка (таблица не ответила) живёт 8 с и перепроверяется.
+        # кэш таблицы — 90 с: если Кассу поправили руками в Google, бот
+        # подхватит не позже; в пределах окна меню остаётся мгновенным
+        ttl = 8 if cached.get("source") == "local" else 90
         if not force and now - _CASH["t"] < ttl:
-            return cached
-        if cached.get("source") != "local" and not force:
             return cached
     r = sheets_call({"action": "balance"}, attempts=2, deadline_s=15)
     if r.get("ok") and "hand" in r:
@@ -1327,9 +1328,10 @@ def go_menu(chat_id, prefix=""):
     body = menu_text(peek_balance())
     if prefix:
         body = prefix + "\n\n" + body
-    send(chat_id, body, reply_kb())
+    r = send(chat_id, body, reply_kb())
     if time.time() - (_CASH.get("t") or 0) > 30:
         bg(fetch_balance, True)
+    return r
 
 
 def start_deal(chat_id, kind=None):
@@ -1694,9 +1696,12 @@ def _perform_undo_body(chat_id, deal):
                 }
             )
             notes.append("по кассе нечего сторнировать")
-    _CASH["t"] = 0
-    _CASH["data"] = None
-    info = local_balance()
+    # записи отмены выше синхронные, лист уже посчитан — цифру берём из
+    # таблицы; не ответила за дедлайн — локальная оценка с «≈»
+    info = fetch_balance(force=True)
+    cash = fmt_money(info.get("hand") or 0)
+    if info.get("source") != "sheet":
+        cash = "≈ " + cash
     go_menu(
         chat_id,
         "отменил.\n\n"
@@ -1704,7 +1709,7 @@ def _perform_undo_body(chat_id, deal):
         + "\n\n"
         + "\n".join(notes)
         + "\n\nна руках  <code>"
-        + fmt_money(info.get("hand") or 0)
+        + cash
         + "</code>",
     )
 
@@ -2282,19 +2287,39 @@ def commit(chat_id):
             extras.append(extra_d)
     if deal.get("type") == "sell":
         _unsold_drop_row(deal.get("sheet_row"))
-    _CASH["t"] = 0
+    # локальную цифру показываем с «≈», после записи меняем в сообщении на
+    # точную из таблицы. t=now (не 0), чтобы go_menu не звал fetch параллельно
+    _CASH["t"] = time.time()
     _CASH["data"] = None
     info = local_balance()
-    go_menu(
-        chat_id,
-        "✓  записал\n\n"
-        + card(deal)
-        + "\n\nна руках  <code>"
-        + fmt_money(info.get("hand") or 0)
-        + "</code>"
-        + "\n<i>пишу в таблицу…</i>"
-        + "\n\nесли человек слился — «Отменить последнее»",
-    )
+
+    def commit_prefix(inf, row=None, failed=False):
+        cash = fmt_money(inf.get("hand") or 0)
+        if inf.get("source") != "sheet":
+            cash = "≈ " + cash
+        if failed:
+            state = "\n<i>таблица не ответила — цифра предварительная, глянь «Касса» позже</i>"
+        elif row is None:
+            state = "\n<i>уточню, когда ответит таблица…</i>"
+        else:
+            state = "\n<i>таблица: ок"
+            if row:
+                state += ", строка %s" % row
+            state += "</i>"
+        return (
+            "✓  записал\n\n"
+            + card(deal)
+            + "\n\nна руках  <code>"
+            + cash
+            + "</code>"
+            + state
+            + "\n\nесли человек слился — «Отменить последнее»"
+        )
+
+    r = go_menu(chat_id, commit_prefix(info))
+    msg_id = None
+    if r.get("ok"):
+        msg_id = (r.get("result") or {}).get("message_id")
 
     def work():
         wr = sheets_call(dict(deal, action="write"))
@@ -2302,8 +2327,21 @@ def commit(chat_id):
             push_sheets(extra_d)
         if wr.get("ok"):
             log("commit sheets ok row=%s" % wr.get("sheet_row"))
+            info2 = fetch_balance(force=True)
+            if msg_id:
+                edit_message(
+                    chat_id,
+                    msg_id,
+                    commit_prefix(info2, row=wr.get("sheet_row")) + "\n\n" + menu_text(info2),
+                )
         elif wr.get("error") not in ("local",):
             send(chat_id, "сделка у бота есть, таблица не приняла — глянь таблицу или повтори.")
+            if msg_id:
+                edit_message(
+                    chat_id,
+                    msg_id,
+                    commit_prefix(local_balance(), failed=True) + "\n\n" + menu_text(peek_balance()),
+                )
 
     bg(work)
 
