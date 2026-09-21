@@ -123,6 +123,103 @@ function doPost(e) {
     cacheDrop_();
     return json_({ok: true});
   }
+  // диагностика колонок K (роль) и L (%): значения, display, формулы, список валидации
+  if (action === 'sales_roles') {
+    if (!sales) return json_({ok: false, error: 'no sheet'});
+    var lastSR = lastDataRow_(sales);
+    if (lastSR < 9) return json_({ok: true, dv: null, rows: []});
+    var nSR = Math.min(80, lastSR - 8);
+    var startSR = lastSR - nSR + 1;
+    var roleVals = sales.getRange(startSR, COL_ROLE, nSR, 1).getValues();
+    var roleForm = sales.getRange(startSR, COL_ROLE, nSR, 1).getFormulas();
+    var pctVals = sales.getRange(startSR, COL_PCT, nSR, 1).getValues();
+    var pctDisp = sales.getRange(startSR, COL_PCT, nSR, 1).getDisplayValues();
+    var pctForm = sales.getRange(startSR, COL_PCT, nSR, 1).getFormulas();
+    var dvSR = null;
+    try {
+      var ruleSR = sales.getRange(startSR, COL_ROLE).getDataValidation();
+      if (ruleSR) {
+        var critSR = ruleSR.getCriteriaValues();
+        var c0SR = critSR[0];
+        dvSR = {
+          type: String(ruleSR.getCriteriaType()),
+          range: (c0SR && c0SR.getA1Notation) ? (c0SR.getSheet().getName() + '!' + c0SR.getA1Notation()) : String(c0SR)
+        };
+      }
+    } catch (e) { dvSR = { err: String(e) }; }
+    var outSR = [];
+    for (var iSR = 0; iSR < nSR; iSR++) {
+      outSR.push({
+        row: startSR + iSR,
+        role: String(roleVals[iSR][0] == null ? '' : roleVals[iSR][0]),
+        pct_disp: String(pctDisp[iSR][0] == null ? '' : pctDisp[iSR][0]),
+        formula: String(roleForm[iSR][0] || pctForm[iSR][0] || '').slice(0, 130)
+      });
+    }
+    // листы с «Правил» в имени: шапка + первые строки (источник формул и выпадашек)
+    var rulesSR = null;
+    var sheetsSR = ss.getSheets();
+    var namesSR = [];
+    for (var sSR = 0; sSR < sheetsSR.length; sSR++) {
+      var nmSR = sheetsSR[sSR].getName();
+      namesSR.push(nmSR);
+      if (!rulesSR && nmSR.toLowerCase().indexOf('правил') >= 0) {
+        var rrSR = sheetsSR[sSR].getRange(1, 1, Math.min(10, sheetsSR[sSR].getLastRow() || 1), 3);
+        var rvSR = rrSR.getValues();
+        var rdSR = rrSR.getDisplayValues();
+        rulesSR = { sheet: nmSR, rows: rvSR, disp: rdSR };
+      }
+    }
+    return json_({ok: true, dv: dvSR, sheets: namesSR, rules: rulesSR, rows: outSR});
+  }
+  // разовая починка (идемпотентна): K канонизируем под тексты «Правил»,
+  // в L восстанавливаем формулу % там, где её затёр бот
+  if (action === 'roles_fix') {
+    if (!sales) return json_({ok: false, error: 'no sheet'});
+    var lastRF = lastDataRow_(sales);
+    if (lastRF < 9) return json_({ok: true, fixed_k: 0, fixed_l: 0, changed: []});
+    var nRF = lastRF - 8;
+    var kValsRF = sales.getRange(9, COL_ROLE, nRF, 1).getValues();
+    var kFormRF = sales.getRange(9, COL_ROLE, nRF, 1).getFormulas();
+    var lFormRF = sales.getRange(9, COL_PCT, nRF, 1).getFormulas();
+    var canonRF = {
+      'И товар, и клиент. Данил — только логистика': 'И товар, и клиент. Данил — только деньги',
+      'Фулл процент, в редких случаях': 'Фулл процент, в редких случаях '
+    };
+    var changedRF = [];
+    var fixedKRF = 0;
+    var fixedLRF = 0;
+    for (var iRF = 0; iRF < nRF; iRF++) {
+      var rowRF = 9 + iRF;
+      var kvRF = String(kValsRF[iRF][0] == null ? '' : kValsRF[iRF][0]);
+      if (!kFormRF[iRF][0] && canonRF[kvRF]) {
+        sales.getRange(rowRF, COL_ROLE).setValue(canonRF[kvRF]);
+        changedRF.push([rowRF, kvRF, canonRF[kvRF]]);
+        fixedKRF++;
+      }
+      if (!lFormRF[iRF][0]) {
+        var fRF = '=ARRAY_CONSTRAIN(ARRAYFORMULA(IF(K' + rowRF + '="";"";IFERROR(INDEX(\'Правила\'!$B$5:$B$10;MATCH(K' + rowRF + ';\'Правила\'!$A$5:$A$10;0));""))); 1; 1)';
+        sales.getRange(rowRF, COL_PCT).setFormula(fRF).setNumberFormat('0%');
+        fixedLRF++;
+      }
+    }
+    // выпадашка K: смотрит в «Правила»!A5:A10 (а не в старый список U2:U6
+    // с устаревшими текстами — из-за него красные уголки на валидных строках)
+    var dvFixedRF = false;
+    try {
+      var rulesSheetRF = ss.getSheetByName('Правила');
+      if (rulesSheetRF) {
+        var wantRF = SpreadsheetApp.newDataValidation()
+          .requireValueInRange(rulesSheetRF.getRange('A5:A10'), true)
+          .setAllowInvalid(true)
+          .build();
+        sales.getRange(9, COL_ROLE, nRF, 1).setDataValidation(wantRF);
+        dvFixedRF = true;
+      }
+    } catch (e) {}
+    cacheDrop_();
+    return json_({ok: true, fixed_k: fixedKRF, fixed_l: fixedLRF, dv_fixed: dvFixedRF, changed: changedRF});
+  }
 
   if (body.cash_dir === 'in' || body.cash_dir === 'out') {
     appendKassa_(kassa, body);
@@ -410,15 +507,9 @@ function addNum_(sh, row, col, v) {
 
 function writeRole_(sh, row, b) {
   if (!b.role) return;
+  // пишем только K (текст роли). L (%) — формульная: IF(K=…;INDEX('Правила'!…)),
+  // считать её за лист нельзя, setValue/clearContent убивают формулу
   sh.getRange(row, COL_ROLE).setValue(b.role);
-  if (b.role_pct !== '' && b.role_pct != null) {
-    var p = Number(b.role_pct);
-    if (p > 1) p = p / 100;
-    sh.getRange(row, COL_PCT).setValue(p).setNumberFormat('0%');
-  } else {
-    // роль без процента: чистим L, чтобы не оставался % прошлой роли
-    sh.getRange(row, COL_PCT).clearContent();
-  }
 }
 
 function appendSales_(sh, b) {
@@ -485,15 +576,8 @@ function updateLot_(sh, b) {
   if (f.delivery != null && f.delivery !== '') sh.getRange(row, COL_DELIVERY).setValue(Number(f.delivery));
   if (f.consumable != null && f.consumable !== '') sh.getRange(row, COL_CONS).setValue(Number(f.consumable));
   if (f.role != null) {
+    // только K: L (%) живёт формулой из «Правил», трогать её нельзя
     sh.getRange(row, COL_ROLE).setValue(f.role);
-    if (f.role_pct != null && f.role_pct !== '') {
-      var p = Number(f.role_pct);
-      if (p > 1) p = p / 100;
-      sh.getRange(row, COL_PCT).setValue(p).setNumberFormat('0%');
-    } else {
-      // роль поменяли на вариант без процента — % тоже убираем
-      sh.getRange(row, COL_PCT).clearContent();
-    }
   }
 }
 
@@ -536,7 +620,8 @@ function reverseKassa_(kassa, item) {
 
 function deleteLot_(sh, row) {
   if (!sh || !row || row < 9) return;
-  var clearCols = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, COL_PCT, COL_CAT, COL_PLACE, COL_BUYER, COL_NOTE];
+  // без COL_PCT: L — формульная (% из «Правил»), чистка сломала бы формулу
+  var clearCols = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, COL_CAT, COL_PLACE, COL_BUYER, COL_NOTE];
   for (var i = 0; i < clearCols.length; i++) {
     sh.getRange(row, clearCols[i]).clearContent();
   }

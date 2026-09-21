@@ -37,9 +37,10 @@ description: Операционный мануал по Telegram-боту учё
 
 1. `clasp pull` → придёт `Код.js`; убедиться, что это живой код (маркеры: `kassa_all`, `COL_ROLE = 11`).
 2. Перезаписать `Код.js` содержимым локального `sheets_webhook.gs`.
-3. `clasp version "<описание>"` → из вывода взять номер версии.
-4. `clasp redeploy AKfycbxvebXrN4KnJFe84ZbjmroRryjpIrGaUIaEubGA2LCxsXsLZGciuyND2akx5y-Oy6_r -V <номер> -d "<описание>"` — обновляет СУЩЕСТВУЮЩЕЕ развёртывание, URL в .env не меняется.
-5. Проверка живости: POST на URL из .env c `{"secret":"…","action":"kassa_all"}` → новый код отвечает `{"ok":true,"rows":[…]}`, старый — `{"ok":true,"sheet_row":0}` (бот пометит «кэш отдал чужой ответ»).
+3. **`clasp push` — обязательно!** Без него `clasp version` снимает слепок СТАРОГО кода проекта (21.09 так уехала @21 без изменений).
+4. `clasp version "<описание>"` → из вывода взять номер версии.
+5. `clasp redeploy AKfycbxvebXrN4KnJFe84ZbjmroRryjpIrGaUIaEubGA2LCxsXsLZGciuyND2akx5y-Oy6_r -V <номер> -d "<описание>"` — обновляет СУЩЕСТВУЮЩЕЕ развёртывание, URL в .env не меняется. Новый код прокидывается до ~1 мин.
+6. Проверка живости: POST на URL из .env c `{"secret":"…","action":"kassa_all"}` → новый код отвечает `{"ok":true,"rows":[…]}`, старый — `{"ok":true,"sheet_row":0}` (бот пометит «кэш отдал чужой ответ»).
 
 **НИКОГДА** не создавать новое развёртывание (ни в UI «Развернуть → Новое развертывание», ни `clasp deploy`): новый URL + доступ «Только я» = бот его не увидит. В проекте уже 8 мёртвых развёртываний.
 
