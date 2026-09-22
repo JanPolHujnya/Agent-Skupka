@@ -1251,22 +1251,17 @@ def menu_text(info=None) -> str:
 def balance_text(info=None) -> str:
     info = info or peek_balance()
     hand = fmt_money(info.get("hand") or 0)
-    start = fmt_money(info.get("start") or 0)
-    inn = fmt_money(info.get("inn") or 0)
-    out = fmt_money(info.get("out") or 0)
     now = datetime.now().strftime("%H:%M")
     src = (
         "таблица, ячейка «На руках»"
         if info.get("source") == "sheet"
         else "пока по записям бота"
     )
+    # только «на руках» и последние движения — старт/пришло/ушло юзер смотрит в таблице
     rows = [
         "<b>Касса</b>  <i>" + now + "</i>",
         HR,
         "На руках     <code>" + hand + "</code>",
-        "Старт        " + start,
-        "Пришло       " + inn,
-        "Ушло         " + out,
         "<i>" + src + "</i>",
     ]
     computed = info.get("computed")
