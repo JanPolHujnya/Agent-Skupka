@@ -135,6 +135,7 @@ function doPost(e) {
     var pctVals = sales.getRange(startSR, COL_PCT, nSR, 1).getValues();
     var pctDisp = sales.getRange(startSR, COL_PCT, nSR, 1).getDisplayValues();
     var pctForm = sales.getRange(startSR, COL_PCT, nSR, 1).getFormulas();
+    var plVals = sales.getRange(startSR, 17, nSR, 1).getValues();
     var dvSR = null;
     try {
       var ruleSR = sales.getRange(startSR, COL_ROLE).getDataValidation();
@@ -147,12 +148,31 @@ function doPost(e) {
         };
       }
     } catch (e) { dvSR = { err: String(e) }; }
+    // Q «Где продано»: значения + полный список выпадашки (для сверки с ботом)
+    var dvQ = null;
+    try {
+      var ruleQ = sales.getRange(startSR, 17).getDataValidation();
+      if (ruleQ) {
+        var critQ = ruleQ.getCriteriaValues();
+        var c0Q = critQ[0];
+        if (c0Q && c0Q.getA1Notation) {
+          dvQ = {
+            type: String(ruleQ.getCriteriaType()),
+            range: c0Q.getSheet().getName() + '!' + c0Q.getA1Notation(),
+            values: (function () { var vs = c0Q.getValues(); var out = []; for (var i = 0; i < vs.length; i++) out.push(String(vs[i][0])); return out; })()
+          };
+        } else {
+          dvQ = { type: String(ruleQ.getCriteriaType()), crit: String(c0Q) };
+        }
+      }
+    } catch (e) { dvQ = { err: String(e) }; }
     var outSR = [];
     for (var iSR = 0; iSR < nSR; iSR++) {
       outSR.push({
         row: startSR + iSR,
         role: String(roleVals[iSR][0] == null ? '' : roleVals[iSR][0]),
         pct_disp: String(pctDisp[iSR][0] == null ? '' : pctDisp[iSR][0]),
+        place: String(plVals[iSR][0] == null ? '' : plVals[iSR][0]),
         formula: String(roleForm[iSR][0] || pctForm[iSR][0] || '').slice(0, 130)
       });
     }
@@ -170,7 +190,7 @@ function doPost(e) {
         rulesSR = { sheet: nmSR, rows: rvSR, disp: rdSR };
       }
     }
-    return json_({ok: true, dv: dvSR, sheets: namesSR, rules: rulesSR, rows: outSR});
+    return json_({ok: true, dv: dvSR, dv_place: dvQ, sheets: namesSR, rules: rulesSR, rows: outSR});
   }
   // разовая починка (идемпотентна): K канонизируем под тексты «Правил»,
   // в L восстанавливаем формулу % там, где её затёр бот
@@ -203,6 +223,26 @@ function doPost(e) {
         fixedLRF++;
       }
     }
+    // Q «Где продано»: канонизируем бот-тексты под список W2:W8 («Avito»→«Авито» и т.п.),
+    // добавляем «Телеграм» в W9 (если пусто) и перенаправляем валидацию на W2:W9
+    var plValsRF = sales.getRange(9, 17, nRF, 1).getValues();
+    var plCanonRF = { 'Avito': 'Авито', 'Telegram': 'Телеграм', 'Знакомые': 'Друг' };
+    var fixedPRF = 0;
+    for (var pRF = 0; pRF < nRF; pRF++) {
+      var pvRF = String(plValsRF[pRF][0] == null ? '' : plValsRF[pRF][0]);
+      if (plCanonRF[pvRF]) {
+        sales.getRange(9 + pRF, 17).setValue(plCanonRF[pvRF]);
+        fixedPRF++;
+      }
+    }
+    var dvQFixedRF = false;
+    try {
+      var wColRF = sales.getRange('W2:W9').getValues();
+      if (String(wColRF[7][0] || '') === '') sales.getRange('W9').setValue('Телеграм');
+      sales.getRange(9, 17, nRF, 1).setDataValidation(
+        SpreadsheetApp.newDataValidation().requireValueInRange(sales.getRange('W2:W9'), true).setAllowInvalid(true).build());
+      dvQFixedRF = true;
+    } catch (e) {}
     // выпадашка K: смотрит в «Правила»!A5:A10 (а не в старый список U2:U6
     // с устаревшими текстами — из-за него красные уголки на валидных строках)
     var dvFixedRF = false;
@@ -218,7 +258,7 @@ function doPost(e) {
       }
     } catch (e) {}
     cacheDrop_();
-    return json_({ok: true, fixed_k: fixedKRF, fixed_l: fixedLRF, dv_fixed: dvFixedRF, changed: changedRF});
+    return json_({ok: true, fixed_k: fixedKRF, fixed_l: fixedLRF, fixed_p: fixedPRF, dv_fixed: dvFixedRF, dv_place_fixed: dvQFixedRF, changed: changedRF});
   }
 
   if (body.cash_dir === 'in' || body.cash_dir === 'out') {
