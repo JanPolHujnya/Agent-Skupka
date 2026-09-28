@@ -86,6 +86,18 @@ SELL_TOTAL = 11
 
 USERS_KEY = "_users"
 
+INV_KEY = "_inv"
+USERS_KEY = "_users"
+INV_OK = "ok"
+INV_MISS = "miss"
+INV_MONTHS = [
+    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+]
+INV_SHEET_OK = "✅ на месте"
+INV_SHEET_MISS = "❌ отсутствует"
+INV_SHEET_UNMARKED = "❌ не отмечено"
+
 
 def load_env():
     env = {}
@@ -187,6 +199,7 @@ def reply_kb():
             [{"text": "🛒 Закуп"}, {"text": "💸 Продажа"}],
             [{"text": "✏️ Лот"}, {"text": "💵 Деньги"}],
             [{"text": "💰 Касса"}, {"text": "Отменить последнее"}],
+            [{"text": "📋 Инвентаризация"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -296,7 +309,7 @@ def progress_line(kind, step):
         total = 4
         title = "Деньги"
     else:
-        titles = {"edit": "Лот", "kind": "Сделка"}
+        titles = {"edit": "Лот", "kind": "Сделка", "inv": "Инвентаризация"}
         return "<b>" + esc(titles.get(kind, kind or "Учёт")) + "</b>"
     n, _name = mapping.get(step, (1, ""))
     return "<b>%s</b>\n%s" % (title, dots(n, total))
@@ -692,12 +705,17 @@ SHEETS_KEY = {
     "setup": "hand",
     "write": "sheet_row",
     "lot": "item",
+    "inv_list": "entries",
+    "inv_get": "items",
+    "inv_start": "session_id",
+    "inv_save": "session_id",
+    "inv_update": "row",
 }
 SHEETS_FOREIGN = ("service", "hand", "items", "entries", "sheet_row", "item")
 
 # поход в таблицу стоит 2-9 с (скорость Apps Script), поэтому повторные
 # чтения в пределах 10 с берем из кэша. любое пишущее действие кэш сбрасывает
-SHEETS_READ = {"balance", "setup", "unsold", "lots", "lot"}
+SHEETS_READ = {"balance", "setup", "unsold", "lots", "lot", "inv_list", "inv_get"}
 SHEETS_CACHE_TTL = 10
 _sheets_cache: dict = {}
 _SHEETS_MU = threading.Lock()
@@ -1081,6 +1099,41 @@ def _filter_lots(items, mode="all", query=""):
     return out
 
 
+
+
+def fetch_inv_list() -> list | None:
+    r = sheets_call({"action": "inv_list"})
+    if r.get("error") == "local" or not r.get("ok"):
+        return None
+    items = r.get("entries") or []
+    return items if isinstance(items, list) else []
+
+
+def fetch_inv_get(session_id) -> list | None:
+    r = sheets_call({"action": "inv_get", "session_id": session_id})
+    if r.get("error") == "local" or not r.get("ok"):
+        return None
+    items = r.get("items") or []
+    return items if isinstance(items, list) else []
+
+
+def period_str(d=None) -> str:
+    d = d or date.today()
+    return d.strftime("%m.%Y")
+
+
+def period_label(period: str) -> str:
+    period = str(period or "")
+    parts = period.split(".")
+    try:
+        m = int(parts[0])
+    except (ValueError, IndexError):
+        return period or "?"
+    name = INV_MONTHS[m - 1] if 1 <= m <= 12 else period
+    year = parts[1] if len(parts) > 1 else ""
+    return name + (" " + str(year) if year else "")
+
+
 def fetch_lots(mode="all", query="") -> list | None:
     _lots_from_disk()
     items = _LOTS.get("items")
@@ -1445,6 +1498,27 @@ def go_back(chat_id):
             ask_note(chat_id)
         else:
             go_menu(chat_id)
+    if kind == "inv":
+        mine = inv_state() and inv_state().get("by") == chat_id
+        if step == "inv_item":
+            inv_list(chat_id, s.get("page") or 0)
+        elif step == "inv_list":
+            inv_categories(chat_id) if mine else go_menu(chat_id)
+        elif step in ("inv_cats", "inv_home", "inv_begin"):
+            inv_home(chat_id) if mine else go_menu(chat_id)
+        elif step in ("inv_fin", "inv_cx"):
+            inv_categories(chat_id) if mine else go_menu(chat_id)
+        elif step == "inv_search":
+            inv_list(chat_id, 0)
+        elif step == "inv_month":
+            inv_month_view(chat_id, s.get("inv_sid") or 0, s.get("inv_page") or 0)
+        elif step == "inv_months":
+            go_menu(chat_id)
+        elif step == "inv_fix":
+            inv_month_view(chat_id, s.get("inv_sid") or 0, s.get("inv_page") or 0)
+        else:
+            go_menu(chat_id)
+        return
         return
     go_menu(chat_id)
 
@@ -2496,6 +2570,9 @@ def on_text(chat_id, text: str):
     if text == "/undo" or cmd in ("отменить последнее", "отменить действие"):
         start_undo(chat_id)
         return
+    if text == "/inv" or text == "/inventory" or cmd in ("инвентаризация", "инвентаризации"):
+        start_inventory(chat_id)
+        return
     s = sess(chat_id)
     step = s.get("step") or "idle"
     if step == "product":
@@ -2574,6 +2651,15 @@ def on_text(chat_id, text: str):
             s["lots"] = items
             persist_sess()
         show_item_list(chat_id, 0)
+        return
+    if step == "inv_search":
+        if len(text) < 1:
+            ui(chat_id, "напиши хотя бы пару символов.", kb([nav_row()]))
+            return
+        s["query"] = text[:40]
+        s["filter_cat"] = s.get("filter_cat") or "all"
+        persist_sess()
+        inv_list(chat_id, 0)
         return
     if step == "date_custom":
         ds = parse_date(text)
@@ -2711,6 +2797,771 @@ def _mut_recent(chat_id, data, window=5.0) -> bool:
     return False
 
 
+def inv_counts(inv):
+    marks = inv.get("marks") or {}
+    ok = sum(1 for v in marks.values() if v == INV_OK)
+    miss = sum(1 for v in marks.values() if v == INV_MISS)
+    return len(inv.get("items") or []), ok, miss
+
+
+def inv_guard(chat_id) -> bool:
+    inv = inv_state()
+    if not inv:
+        start_inventory(chat_id)
+        return False
+    if inv.get("by") != chat_id:
+        inv_foreign(chat_id, inv)
+        return False
+    return True
+
+
+def inv_item_card(it, mark=None) -> str:
+    rows = [lot_card(it)]
+    cur = {INV_OK: "✅ на месте", INV_MISS: "❌ отсутствует"}.get(mark or "")
+    if cur:
+        rows.append("")
+        rows.append("Инвентаризация: <b>" + cur + "</b>")
+    return "\n".join(rows)
+
+
+def inv_item_label(it, mark) -> str:
+    icon = {INV_OK: "✅", INV_MISS: "❌"}.get(mark or "", "⬜")
+    name = str(it.get("product") or "?")
+    tail = fmt_money(it.get("cost") or 0)
+    room = 58 - len(icon) - len(tail) - 3
+    if len(name) > room:
+        name = name[: max(8, room)]
+    return ("%s %s · %s" % (icon, name, tail))[:64]
+
+
+def start_inventory(chat_id):
+    inv = inv_state()
+    if inv:
+        if inv.get("by") == chat_id:
+            inv_home(chat_id)
+        else:
+            inv_foreign(chat_id, inv)
+        return
+    s = sess(chat_id)
+    SESSIONS[sid(chat_id)] = {"step": "inv_begin", "type": "inv", "msg_id": s.get("msg_id")}
+    persist_sess()
+    items = fetch_unsold()
+    if not items:
+        ui(
+            chat_id,
+            "<b>Инвентаризация</b>\n\nсписок лотов сейчас недоступен.\nможно открыть прошлые инвентаризации.",
+            kb([[btn("📜 прошлые", "iv:hist")], [btn("↻ ещё раз", "m:inv")], [btn("‹ меню", "m:cancel")]]),
+            force_new=True,
+        )
+        return
+    s = sess(chat_id)
+    s["unsold"] = items
+    s["filter_cat"] = "all"
+    s["query"] = ""
+    persist_sess()
+    ui(
+        chat_id,
+        "<b>Инвентаризация</b>\n"
+        + HR
+        + "\nнепроданных лотов: <b>"
+        + str(len(items))
+        + "</b>\nпройди по коробкам и отметь, что на месте.\nне отмеченное посчитаю отсутствующим.",
+        kb(
+            [
+                [btn("▶️ начать", "iv:begin")],
+                [btn("📜 прошлые", "iv:hist")],
+                [btn("‹ меню", "m:cancel")],
+            ]
+        ),
+        force_new=True,
+    )
+
+
+def inv_home(chat_id):
+    inv = inv_state()
+    if not inv:
+        start_inventory(chat_id)
+        return
+    s = sess(chat_id)
+    SESSIONS[sid(chat_id)] = {
+        "step": "inv_home",
+        "type": "inv",
+        "msg_id": s.get("msg_id"),
+        "unsold": inv.get("items") or [],
+        "filter_cat": "all",
+        "query": "",
+        "page": 0,
+    }
+    persist_sess()
+    total, ok, miss = inv_counts(inv)
+    started = str(inv.get("started") or "")[:16].replace("T", " ")
+    ui(
+        chat_id,
+        "<b>Инвентаризация идёт</b>\n"
+        + HR
+        + "\nначал "
+        + esc(str(inv.get("by_name") or ""))
+        + " · "
+        + started
+        + "\nотмечено <b>"
+        + str(ok + miss)
+        + "</b> из <b>"
+        + str(total)
+        + "</b> · ✅ "
+        + str(ok)
+        + " · ❌ "
+        + str(miss),
+        kb(
+            [
+                [btn("продолжить", "iv:cats")],
+                [btn("🏁 завершить", "iv:fin")],
+                [btn("📜 прошлые", "iv:hist")],
+                [btn("🚪 отменить инвентаризацию", "iv:cxo")],
+            ]
+        ),
+    )
+
+
+def inv_foreign(chat_id, inv):
+    total, ok, miss = inv_counts(inv)
+    started = str(inv.get("started") or "")[:16].replace("T", " ")
+    ui(
+        chat_id,
+        "<b>Инвентаризация уже идёт</b>\n"
+        + HR
+        + "\nначал "
+        + esc(str(inv.get("by_name") or ""))
+        + " · "
+        + started
+        + "\nотмечено "
+        + str(ok + miss)
+        + " из "
+        + str(total)
+        + "\n\nвторую не начну — дождись завершения.",
+        kb([[btn("📜 прошлые", "iv:hist")], [btn("‹ меню", "m:cancel")]]),
+    )
+
+
+def inv_begin(chat_id):
+    inv = inv_state()
+    if inv:
+        if inv.get("by") == chat_id:
+            inv_home(chat_id)
+        else:
+            inv_foreign(chat_id, inv)
+        return
+    s = sess(chat_id)
+    items = s.get("unsold") or fetch_unsold() or []
+    if not items:
+        start_inventory(chat_id)
+        return
+    name = user_name(chat_id)
+    ui(chat_id, "открываю инвентаризацию…")
+    r = sheets_call({"action": "inv_start", "who": name}, attempts=1, deadline_s=12)
+    session_id = 0
+    if r.get("ok"):
+        try:
+            session_id = int(r.get("session_id") or 0)
+        except (TypeError, ValueError):
+            session_id = 0
+    snapshot = [
+        {
+            "row": int(it.get("row") or 0),
+            "product": str(it.get("product") or ""),
+            "category": str(it.get("category") or "Другое"),
+            "lot": str(it.get("lot") or ""),
+            "buy": str(it.get("buy") or ""),
+            "cost": int(it.get("cost") or 0),
+        }
+        for it in items
+    ]
+    SESSIONS[INV_KEY] = {
+        "active": True,
+        "by": chat_id,
+        "by_name": name,
+        "started": datetime.now().isoformat(timespec="seconds"),
+        "session_id": session_id,
+        "items": snapshot,
+        "marks": {},
+    }
+    persist_sess()
+    inv_categories(chat_id)
+
+
+def inv_categories(chat_id):
+    if not inv_guard(chat_id):
+        return
+    inv = inv_state()
+    items = inv.get("items") or []
+    s = sess(chat_id)
+    s["step"] = "inv_cats"
+    s["unsold"] = items
+    s["filter_cat"] = "all"
+    s["query"] = ""
+    s["page"] = 0
+    persist_sess()
+    counts = cat_counts(items)
+    rows = []
+    pair = []
+    names = [c for c in CATS if counts.get(c)]
+    extra = [c for c in sorted(counts) if c not in CATS]
+    for name in names + extra:
+        pair.append(btn(cat_label(name, counts[name]), "iv:c:" + name[:24]))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([btn("все · %s" % len(items), "iv:c:all")])
+    rows.append([btn("🏁 завершить", "iv:fin")])
+    rows.append(nav_row())
+    total, ok, miss = inv_counts(inv)
+    ui(
+        chat_id,
+        "<b>Инвентаризация</b>\nотмечено %d из %d · ✅ %d · ❌ %d\n\nчто смотрим?"
+        % (ok + miss, total, ok, miss),
+        kb(rows),
+    )
+
+
+def inv_list(chat_id, page=0, force_new=False):
+    if not inv_guard(chat_id):
+        return
+    inv = inv_state()
+    s = sess(chat_id)
+    items = filtered_items(s)
+    marks = inv.get("marks") or {}
+    if not items:
+        ui(chat_id, "по этому фильтру ничего нет.", kb([[btn("‹ категории", "iv:cats")]]))
+        return
+    page = max(0, page)
+    max_page = max(0, (len(items) - 1) // PAGE)
+    if page > max_page:
+        page = max_page
+    s["page"] = page
+    s["step"] = "inv_list"
+    persist_sess()
+    rows = []
+    for it in items[page * PAGE : (page + 1) * PAGE]:
+        mark = marks.get(str(it.get("row")))
+        rows.append([btn(inv_item_label(it, mark), "iv:it:" + str(it.get("row")))])
+    nav = []
+    if page > 0:
+        nav.append(btn("‹", "iv:pg:%d" % (page - 1)))
+    nav.append(btn("%d / %d" % (page + 1, max_page + 1), "iv:pg:%d" % page))
+    if page < max_page:
+        nav.append(btn("›", "iv:pg:%d" % (page + 1)))
+    rows.append(nav)
+    rows.append([btn("‹ категории", "iv:cats"), btn("🔍 поиск", "iv:srch")])
+    rows.append([btn("🏁 завершить", "iv:fin")])
+    total, ok, miss = inv_counts(inv)
+    q = s.get("query") or ""
+    cat = s.get("filter_cat")
+    bits = ["%s шт." % len(items)]
+    if cat and cat != "all":
+        bits.append(cat)
+    if q:
+        bits.append("«" + q + "»")
+    ui(
+        chat_id,
+        "<b>Инвентаризация</b>\nотмечено %d из %d · ✅ %d · ❌ %d\n\n%s"
+        % (ok + miss, total, ok, miss, " · ".join(bits)),
+        kb(rows),
+        force_new=force_new,
+    )
+
+
+def inv_ask_search(chat_id):
+    s = sess(chat_id)
+    s["step"] = "inv_search"
+    persist_sess()
+    ui(
+        chat_id,
+        "<b>Инвентаризация</b>\n\nнапиши кусок названия.\nнапример: <code>580</code> или <code>xeon</code>",
+        kb([[btn("‹ к списку", "iv:cats")]]),
+    )
+
+
+def inv_item(chat_id, row: int):
+    if not inv_guard(chat_id):
+        return
+    inv = inv_state()
+    picked = None
+    for it in inv.get("items") or []:
+        if int(it.get("row") or 0) == row:
+            picked = it
+            break
+    if not picked:
+        ui(chat_id, "лот не в списке инвентаризации.")
+        inv_list(chat_id, sess(chat_id).get("page") or 0)
+        return
+    s = sess(chat_id)
+    s["step"] = "inv_item"
+    s["inv_row"] = row
+    persist_sess()
+    marks = inv.get("marks") or {}
+    ui(
+        chat_id,
+        inv_item_card(picked, marks.get(str(row))),
+        kb(
+            [
+                [btn("✔️ на месте", "iv:ok:" + str(row)), btn("❌ отсутствует", "iv:no:" + str(row))],
+                [btn("‹ к списку", "iv:back")],
+            ]
+        ),
+    )
+
+
+def inv_mark(chat_id, row: int, mark: str):
+    if not inv_guard(chat_id):
+        return
+    inv = inv_state()
+    marks = inv.setdefault("marks", {})
+    marks[str(row)] = mark
+    persist_sess()
+    inv_list(chat_id, sess(chat_id).get("page") or 0)
+
+
+def inv_finish(chat_id):
+    if not inv_guard(chat_id):
+        return
+    inv = inv_state()
+    s = sess(chat_id)
+    s["step"] = "inv_fin"
+    persist_sess()
+    total, ok, miss = inv_counts(inv)
+    unmarked = total - ok - miss
+    rows = [
+        "🏁 <b>Завершить инвентаризацию?</b>",
+        HR,
+        "всего лотов     " + str(total),
+        "✅ на месте     " + str(ok),
+        "❌ отсутствует  " + str(miss),
+    ]
+    if unmarked > 0:
+        rows.append("⬜ не отмечено   " + str(unmarked) + " — посчитаю отсутствующими")
+    ui(
+        chat_id,
+        "\n".join(rows),
+        kb(
+            [
+                [btn("✓  записать и завершить", "iv:go")],
+                [btn("‹ к списку", "iv:cats")],
+                [btn("🚪 отменить инвентаризацию", "iv:cxo")],
+            ]
+        ),
+    )
+
+
+def inv_finish_confirm(chat_id, force=False):
+    inv = inv_state()
+    if not inv:
+        go_menu(chat_id, "инвентаризация уже не идёт.")
+        return
+    if inv.get("by") != chat_id:
+        inv_foreign(chat_id, inv)
+        return
+    total, ok, miss = inv_counts(inv)
+    marks = inv.get("marks") or {}
+    unmarked = total - ok - miss
+    items = []
+    for it in inv.get("items") or []:
+        m = marks.get(str(it.get("row")))
+        if m == INV_OK:
+            status = INV_SHEET_OK
+        elif m == INV_MISS:
+            status = INV_SHEET_MISS
+        else:
+            status = INV_SHEET_UNMARKED
+        items.append(
+            {
+                "sheet_row": int(it.get("row") or 0),
+                "product": str(it.get("product") or ""),
+                "buy": str(it.get("buy") or ""),
+                "cost": int(it.get("cost") or 0),
+                "status": status,
+            }
+        )
+    period = period_str()
+    saved = False
+    if not force:
+        r = sheets_call(
+            {
+                "action": "inv_save",
+                "session_id": inv.get("session_id") or 0,
+                "date": today_str(),
+                "period": period,
+                "who": inv.get("by_name") or "",
+                "counts": {"total": total, "ok": ok, "miss": miss + unmarked},
+                "items": items,
+            }
+        )
+        if r.get("ok") and (r.get("wrote") is not None or r.get("session_id")):
+            saved = True
+        if not saved:
+            ui(
+                chat_id,
+                "таблица не ответила, ничего не записал.\nинвентаризация продолжает идти.",
+                kb(
+                    [
+                        [btn("↻ повторить", "iv:go")],
+                        [btn("закончить без записи", "iv:drop")],
+                        [btn("‹ к списку", "iv:cats")],
+                    ]
+                ),
+            )
+            return
+    SESSIONS.pop(INV_KEY, None)
+    persist_sess()
+    rows = [
+        "🏁 <b>Инвентаризация записана</b>",
+        HR,
+        "период       " + period_label(period),
+        "всего        " + str(total),
+        "✅ на месте  " + str(ok),
+        "❌ отсутствует  " + str(miss + unmarked),
+    ]
+    if saved:
+        rows.append("<i>записал в таблицу, лист «Инвентаризация».</i>")
+    else:
+        rows.append("<i>в таблицу не записывал — закончено без записи.</i>")
+    gone = [it for it in items if it["status"] != INV_SHEET_OK]
+    if gone:
+        rows.append("")
+        rows.append("<b>отсутствуют:</b>")
+        for it in gone[:15]:
+            rows.append("• " + esc(it["product"]) + " · " + fmt_money(it["cost"]))
+        if len(gone) > 15:
+            rows.append("<i>и ещё " + str(len(gone) - 15) + "</i>")
+    go_menu(chat_id, "\n".join(rows))
+
+
+def inv_cancel_ask(chat_id):
+    if not inv_guard(chat_id):
+        return
+    s = sess(chat_id)
+    s["step"] = "inv_cx"
+    persist_sess()
+    ui(
+        chat_id,
+        "🚪 отменить инвентаризацию?\nотметки пропадут, в журнале появится «отменена».",
+        kb([[btn("да, отменить", "iv:cxd")], [btn("‹ нет", "iv:cats")]]),
+    )
+
+
+def inv_cancel_do(chat_id):
+    inv = inv_state()
+    if not inv:
+        go_menu(chat_id, "инвентаризация уже не идёт.")
+        return
+    if inv.get("by") == chat_id and inv.get("session_id"):
+        sheets_call({"action": "inv_cancel", "session_id": inv.get("session_id")})
+    SESSIONS.pop(INV_KEY, None)
+    persist_sess()
+    go_menu(chat_id, "инвентаризация отменена, отметки сброшены.")
+
+
+def inv_history(chat_id):
+    s = sess(chat_id)
+    SESSIONS[sid(chat_id)] = {
+        "step": "inv_months",
+        "type": "inv",
+        "msg_id": s.get("msg_id"),
+    }
+    persist_sess()
+    ui(chat_id, "смотрю журнал…")
+    r = sheets_call({"action": "inv_list"}, attempts=1, deadline_s=12)
+    entries = r.get("entries") if r.get("ok") else None
+    if not isinstance(entries, list):
+        ui(
+            chat_id,
+            "журнал сейчас не открылся. попробуй ещё раз.",
+            kb([[btn("↻ ещё раз", "iv:hist")], [btn("‹ меню", "m:cancel")]]),
+        )
+        return
+    s = sess(chat_id)
+    s["inv_entries"] = entries
+    persist_sess()
+    done = {}
+    for e in entries:
+        status = str(e.get("status") or "")
+        if "завершена" not in status:
+            continue
+        p = str(e.get("period") or "")
+        if not p:
+            continue
+        prev = done.get(p)
+        if not prev or int(e.get("id") or 0) > int(prev.get("id") or 0):
+            done[p] = e
+    rows = []
+    inv = inv_state()
+    if inv:
+        total, ok, miss = inv_counts(inv)
+        rows.append([btn("🟡 идёт сейчас · %d/%d" % (ok + miss, total), "iv:home")])
+    for p in sorted(done, reverse=True):
+        e = done[p]
+        label = "%s · всего %s · ❌ %s" % (period_label(p), e.get("total") or "?", e.get("miss") or "?")
+        rows.append([btn(label[:60], "iv:h:%s" % e.get("id"))])
+    if not rows:
+        rows.append([btn("завершённых пока нет", "iv:none")])
+    rows.append([btn("‹ меню", "m:cancel")])
+    ui(
+        chat_id,
+        "<b>Инвентаризации по месяцам</b>\n\n<i>просмотр за месяц. отсутствующие можно поправить.</i>",
+        kb(rows),
+    )
+
+
+def inv_month_view(chat_id, session_id: int, page=0, refresh=False):
+    s = sess(chat_id)
+    items = s.get("inv_items") or []
+    if refresh or not items or s.get("inv_sid") != session_id:
+        ui(chat_id, "смотрю журнал…")
+        got = fetch_inv_get(session_id)
+        if got is None:
+            ui(chat_id, "таблица не отвечает.")
+            return
+        items = got
+    s["step"] = "inv_month"
+    s["inv_sid"] = session_id
+    s["inv_items"] = items
+    entry = None
+    for e in s.get("inv_entries") or []:
+        if int(e.get("id") or 0) == session_id:
+            entry = e
+            break
+    if entry is None:
+        entries = fetch_inv_list() or []
+        s["inv_entries"] = entries
+        for e in entries:
+            if int(e.get("id") or 0) == session_id:
+                entry = e
+                break
+    missing = [it for it in items if str(it.get("status") or "").startswith("❌")]
+    okc = len(items) - len(missing)
+    head = [
+        "<b>" + period_label(str((entry or {}).get("period") or "")) + "</b>",
+        HR,
+    ]
+    if entry:
+        if entry.get("date"):
+            head.append(line("Дата", str(entry.get("date"))))
+        if entry.get("who"):
+            head.append(line("Проводил", esc(str(entry.get("who")))))
+    head.append(line("Всего", str(len(items))))
+    head.append(line("На месте", str(okc)))
+    head.append(line("Отсутствует", str(len(missing))))
+    head.append("")
+    head.append("<i>отсутствующие — тапни, чтобы поправить</i>")
+    rows = []
+    if missing:
+        page = max(0, page)
+        max_page = max(0, (len(missing) - 1) // PAGE)
+        if page > max_page:
+            page = max_page
+        s["inv_page"] = page
+        for it in missing[page * PAGE : (page + 1) * PAGE]:
+            label = ("%s · %s" % (str(it.get("product") or "?"), fmt_money(it.get("cost") or 0)))[:60]
+            rows.append([btn(label, "iv:fix:%s:%s" % (session_id, it.get("sheet_row")))])
+        nav = []
+        if page > 0:
+            nav.append(btn("‹", "iv:mp:%s:%d" % (session_id, page - 1)))
+        nav.append(btn("%d / %d" % (page + 1, max_page + 1), "iv:mp:%s:%d" % (session_id, page)))
+        if page < max_page:
+            nav.append(btn("›", "iv:mp:%s:%d" % (session_id, page + 1)))
+        rows.append(nav)
+    else:
+        s["inv_page"] = 0
+        rows.append([btn("всё на месте", "iv:none")])
+    rows.append([btn("‹ к месяцам", "iv:hist")])
+    persist_sess()
+    ui(chat_id, "\n".join(head), kb(rows))
+
+
+def inv_fix_card(chat_id, session_id: int, sheet_row: int):
+    s = sess(chat_id)
+    it = None
+    for x in s.get("inv_items") or []:
+        if int(x.get("sheet_row") or 0) == sheet_row:
+            it = x
+            break
+    if it is None:
+        items = fetch_inv_get(session_id) or []
+        s["inv_items"] = items
+        persist_sess()
+        for x in items:
+            if int(x.get("sheet_row") or 0) == sheet_row:
+                it = x
+                break
+    if it is None:
+        ui(chat_id, "не нашёл этот лот в журнале.")
+        return
+    s["step"] = "inv_fix"
+    s["inv_fix_row"] = sheet_row
+    persist_sess()
+    rows = [
+        "📦 <b>" + esc(str(it.get("product") or "?")) + "</b>",
+        HR,
+        line("Закуп", fmt_money(it.get("cost") or 0)),
+        line("Было", esc(str(it.get("status") or ""))),
+    ]
+    if it.get("fixed"):
+        rows.append(line("Правка", esc(str(it.get("fixed")))))
+    rows.append("")
+    rows.append("что теперь?")
+    ui(
+        chat_id,
+        "\n".join(rows),
+        kb(
+            [
+                [btn("✅ на месте", "iv:fx:%s:%s:ok" % (session_id, sheet_row))],
+                [btn("❌ отсутствует", "iv:fx:%s:%s:no" % (session_id, sheet_row))],
+                [btn("‹ назад", "iv:h:%s" % session_id)],
+            ]
+        ),
+    )
+
+
+def inv_fix_apply(chat_id, session_id: int, sheet_row: int, mark: str):
+    status = INV_SHEET_OK if mark == "ok" else INV_SHEET_MISS
+    r = sheets_call(
+        {
+            "action": "inv_update",
+            "session_id": session_id,
+            "sheet_row": sheet_row,
+            "status": status,
+            "fixed": today_str() + " · " + user_name(chat_id),
+        }
+    )
+    if not r.get("ok") or not r.get("row"):
+        ui(chat_id, "таблица не ответила, правка не записалась.")
+        return
+    s = sess(chat_id)
+    for x in s.get("inv_items") or []:
+        if int(x.get("sheet_row") or 0) == sheet_row:
+            x["status"] = status
+            x["fixed"] = today_str()
+    persist_sess()
+    inv_month_view(chat_id, session_id, s.get("inv_page") or 0, refresh=True)
+
+
+
+
+def on_inv_callback(chat_id, data):
+    s = sess(chat_id)
+    if data == "iv:begin":
+        inv_begin(chat_id)
+        return
+    if data == "iv:hist":
+        inv_history(chat_id)
+        return
+    if data == "iv:home":
+        inv = inv_state()
+        if not inv:
+            start_inventory(chat_id)
+        elif inv.get("by") == chat_id:
+            inv_home(chat_id)
+        else:
+            inv_foreign(chat_id, inv)
+        return
+    if data == "iv:cats":
+        if inv_guard(chat_id):
+            inv_categories(chat_id)
+        return
+    if data == "iv:back":
+        inv_list(chat_id, s.get("page") or 0)
+        return
+    if data == "iv:srch":
+        inv_ask_search(chat_id)
+        return
+    if data == "iv:fin":
+        inv_finish(chat_id)
+        return
+    if data == "iv:go":
+        inv_finish_confirm(chat_id)
+        return
+    if data == "iv:drop":
+        inv_finish_confirm(chat_id, force=True)
+        return
+    if data == "iv:cxo":
+        inv_cancel_ask(chat_id)
+        return
+    if data == "iv:cxd":
+        inv_cancel_do(chat_id)
+        return
+    if data == "iv:none":
+        return
+    if data.startswith("iv:c:"):
+        cat = data.split(":", 2)[2]
+        s["filter_cat"] = cat
+        s["query"] = ""
+        persist_sess()
+        inv_list(chat_id, 0)
+        return
+    if data.startswith("iv:pg:"):
+        try:
+            page = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            page = 0
+        inv_list(chat_id, max(0, page))
+        return
+    if data.startswith("iv:it:"):
+        try:
+            row = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            return
+        inv_item(chat_id, row)
+        return
+    if data.startswith("iv:ok:"):
+        try:
+            row = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            return
+        inv_mark(chat_id, row, INV_OK)
+        return
+    if data.startswith("iv:no:"):
+        try:
+            row = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            return
+        inv_mark(chat_id, row, INV_MISS)
+        return
+    if data.startswith("iv:fix:"):
+        parts = data.split(":")
+        if len(parts) < 4:
+            return
+        try:
+            inv_fix_card(chat_id, int(parts[2]), int(parts[3]))
+        except ValueError:
+            return
+        return
+    if data.startswith("iv:fx:"):
+        parts = data.split(":")
+        if len(parts) < 5:
+            return
+        try:
+            inv_fix_apply(chat_id, int(parts[2]), int(parts[3]), parts[4])
+        except ValueError:
+            return
+        return
+    if data.startswith("iv:mp:"):
+        parts = data.split(":")
+        if len(parts) < 4:
+            return
+        try:
+            inv_month_view(chat_id, int(parts[2]), max(0, int(parts[3])))
+        except ValueError:
+            return
+        return
+    if data.startswith("iv:h:"):
+        try:
+            session_id = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            return
+        inv_month_view(chat_id, session_id, refresh=True)
+        return
+
+
 def on_callback(chat_id, cb_id, data: str, message_id=None):
     data = data or ""
     if data in ("ok", "xd:yes", "un:yes") and _mut_recent(chat_id, data):
@@ -2741,6 +3592,9 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
     if data == "m:cash":
         start_cash(chat_id)
         return
+    if data == "m:inv":
+        start_inventory(chat_id)
+        return
     if data == "m:edit":
         start_edit(chat_id)
         return
@@ -2749,6 +3603,9 @@ def on_callback(chat_id, cb_id, data: str, message_id=None):
         return
     if data == "m:undo":
         start_undo(chat_id)
+        return
+    if data.startswith("iv:"):
+        on_inv_callback(chat_id, data)
         return
     if data == "un:no":
         go_menu(chat_id, "ок, оставил как было.")
