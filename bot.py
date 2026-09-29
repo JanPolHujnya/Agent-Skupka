@@ -1117,6 +1117,13 @@ def fetch_inv_get(session_id) -> list | None:
     return items if isinstance(items, list) else []
 
 
+def inv_state():
+    inv = SESSIONS.get(INV_KEY)
+    if isinstance(inv, dict) and inv.get("active"):
+        return inv
+    return None
+
+
 def period_str(d=None) -> str:
     d = d or date.today()
     return d.strftime("%m.%Y")
