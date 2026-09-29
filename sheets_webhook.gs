@@ -238,6 +238,51 @@ function doPost(e) {
     }
     return json_({ok: true, month: tailR, sold: soldR, bought: boughtR});
   }
+  // разовая уборка журнала инвентаризаций: оставляем только одну сессию (body.keep),
+  // её шапку и позиции переставляем компактно с 9-й строки, остальное очищаем
+  if (action === 'inv_clean') {
+    var shC = ensureInvSheet_(ss);
+    if (!shC) return json_({ok: false, error: 'no sheet'});
+    var keepC = Number(body.keep || 0);
+    var lastC = nextRow_(shC, 1, 9) - 1;
+    var lastD = nextRow_(shC, 10, 9) - 1;
+    var maxC = Math.max(lastC, lastD);
+    if (maxC < 9) return json_({ok: true, kept: 0, details: 0});
+    var headsC = shC.getRange(9, 1, maxC - 8, 7).getValues();
+    var detsC = shC.getRange(9, 10, maxC - 8, 9).getValues();
+    var keepHeadC = null;
+    var keepDetC = [];
+    for (var iC = 0; iC < headsC.length; iC++) {
+      if ((9 + iC) === keepC) keepHeadC = headsC[iC];
+    }
+    if (!keepHeadC) return json_({ok: false, error: 'no such session'});
+    for (var jC = 0; jC < detsC.length; jC++) {
+      if (Number(detsC[jC][0]) === keepC && detsC[jC][3]) keepDetC.push(detsC[jC]);
+    }
+    if (!keepDetC.length) {
+      // старый номер сессии мог не совпасть с новой строкой шапки — спасаем все детали
+      for (var jD = 0; jD < detsC.length; jD++) {
+        if (detsC[jD][3]) keepDetC.push(detsC[jD]);
+      }
+    }
+    for (var jE = 0; jE < keepDetC.length; jE++) {
+      keepDetC[jE][0] = keepC; // номер сессии = строка шапки, иначе бот не найдёт детали
+    }
+    shC.getRange(9, 1, maxC - 8, 18).clear();
+    shC.getRange(9, 1, 1, 7).setValues([keepHeadC]);
+    var stHeadC = String(keepHeadC[6]);
+    shC.getRange(9, 7).setBackground(stHeadC.indexOf('🟢') === 0 ? INV_C_GO : (stHeadC.indexOf('⚪') === 0 ? INV_C_OFF : INV_C_WAIT));
+    if (keepDetC.length) {
+      shC.getRange(9, 10, keepDetC.length, 9).setValues(keepDetC);
+      shC.getRange(9, 11, keepDetC.length, 1).setNumberFormat('dd.mm.yyyy');
+      for (var kC = 0; kC < keepDetC.length; kC++) {
+        var stC = String(keepDetC[kC][7]);
+        shC.getRange(9 + kC, 17).setBackground(stC.indexOf('✅') === 0 ? INV_C_GO : (stC.indexOf('💸') === 0 ? INV_C_WAIT : INV_C_MISS));
+      }
+    }
+    cacheDrop_();
+    return json_({ok: true, kept: keepC, details: keepDetC.length});
+  }
   // разовая починка (идемпотентна): K канонизируем под тексты «Правил»,
   // в L восстанавливаем формулу % там, где её затёр бот
   if (action === 'roles_fix') {
