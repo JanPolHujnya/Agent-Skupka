@@ -192,6 +192,52 @@ function doPost(e) {
     }
     return json_({ok: true, dv: dvSR, dv_place: dvQ, sheets: namesSR, rules: rulesSR, rows: outSR});
   }
+  // месячный отчёт: продажи (sell-дата в месяце) и закупки (buy-дата в месяце),
+  // ПОЛНЫЙ лист без лимита 80; body.month='09', body.year='2026'
+  if (action === 'report') {
+    if (!sales) return json_({ok: false, error: 'no sheet'});
+    var mR = String(body.month || '09');
+    var yR = String(body.year || '2026');
+    var tailR = mR + '.' + yR;
+    var lastR = lastDataRow_(sales);
+    var soldR = [];
+    var boughtR = [];
+    if (lastR >= 9) {
+      var vR = sales.getRange(9, 1, lastR - 8, 22).getValues();
+      var dR = sales.getRange(9, 1, lastR - 8, 22).getDisplayValues();
+      for (var iR2 = 0; iR2 < vR.length; iR2++) {
+        var rowR2 = 9 + iR2;
+        if (!vR[iR2][2] && !vR[iR2][3]) continue;
+        var bStrR = String(dR[iR2][2] || '');
+        var sStrR = String(dR[iR2][3] || '');
+        // строка дисплея 'dd.mm.yyyy': месяц-год с 3-й позиции; плюс надёжная проверка по Date
+        var bInR = (bStrR.length >= 10 && bStrR.slice(3) === tailR) ||
+          (vR[iR2][2] instanceof Date &&
+            ('0' + (vR[iR2][2].getMonth() + 1)).slice(-2) === mR &&
+            String(vR[iR2][2].getFullYear()) === yR);
+        var sInR = (sStrR.length >= 10 && sStrR.slice(3) === tailR) ||
+          (vR[iR2][3] instanceof Date &&
+            ('0' + (vR[iR2][3].getMonth() + 1)).slice(-2) === mR &&
+            String(vR[iR2][3].getFullYear()) === yR);
+        var baseR = {
+          row: rowR2,
+          product: String(vR[iR2][4] || ''),
+          category: String(vR[iR2][19] || 'Другое'),
+          cost: num_(vR[iR2][5]),
+          delivery: num_(vR[iR2][6]),
+          consumable: num_(vR[iR2][7]),
+          sale: num_(vR[iR2][8]),
+          buy: bStrR, sell: sStrR,
+          place: String(dR[iR2][16] || ''),
+          role: String(vR[iR2][10] || ''),
+          pct_disp: String(dR[iR2][11] || '')
+        };
+        if (bInR) boughtR.push(baseR);
+        if (sInR) soldR.push(baseR);
+      }
+    }
+    return json_({ok: true, month: tailR, sold: soldR, bought: boughtR});
+  }
   // разовая починка (идемпотентна): K канонизируем под тексты «Правил»,
   // в L восстанавливаем формулу % там, где её затёр бот
   if (action === 'roles_fix') {
