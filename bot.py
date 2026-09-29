@@ -90,12 +90,14 @@ INV_KEY = "_inv"
 USERS_KEY = "_users"
 INV_OK = "ok"
 INV_MISS = "miss"
+INV_SOLD = "sold"
 INV_MONTHS = [
     "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
     "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
 ]
 INV_SHEET_OK = "✅ на месте"
 INV_SHEET_MISS = "❌ отсутствует"
+INV_SHEET_SOLD = "💸 продано"
 INV_SHEET_UNMARKED = "❌ не отмечено"
 
 
@@ -1517,6 +1519,8 @@ def go_back(chat_id):
             inv_categories(chat_id) if mine else go_menu(chat_id)
         elif step == "inv_search":
             inv_list(chat_id, 0)
+        elif step == "inv_note":
+            inv_item(chat_id, s.get("inv_row") or 0)
         elif step == "inv_month":
             inv_month_view(chat_id, s.get("inv_sid") or 0, s.get("inv_page") or 0)
         elif step == "inv_months":
@@ -2659,6 +2663,16 @@ def on_text(chat_id, text: str):
             persist_sess()
         show_item_list(chat_id, 0)
         return
+    if step == "inv_note":
+        inv = inv_state()
+        if not inv or inv.get("by") != chat_id:
+            go_menu(chat_id)
+            return
+        row = int(s.get("inv_row") or 0)
+        inv.setdefault("notes", {})[str(row)] = (text or "").strip()[:100]
+        persist_sess()
+        inv_item(chat_id, row)
+        return
     if step == "inv_search":
         if len(text) < 1:
             ui(chat_id, "напиши хотя бы пару символов.", kb([nav_row()]))
@@ -2808,7 +2822,8 @@ def inv_counts(inv):
     marks = inv.get("marks") or {}
     ok = sum(1 for v in marks.values() if v == INV_OK)
     miss = sum(1 for v in marks.values() if v == INV_MISS)
-    return len(inv.get("items") or []), ok, miss
+    sold = sum(1 for v in marks.values() if v == INV_SOLD)
+    return len(inv.get("items") or []), ok, miss, sold
 
 
 def inv_guard(chat_id) -> bool:
@@ -2822,17 +2837,19 @@ def inv_guard(chat_id) -> bool:
     return True
 
 
-def inv_item_card(it, mark=None) -> str:
+def inv_item_card(it, mark=None, note=None) -> str:
     rows = [lot_card(it)]
-    cur = {INV_OK: "✅ на месте", INV_MISS: "❌ отсутствует"}.get(mark or "")
+    cur = {INV_OK: "✅ на месте", INV_MISS: "❌ отсутствует", INV_SOLD: "💸 продано"}.get(mark or "")
     if cur:
         rows.append("")
         rows.append("Инвентаризация: <b>" + cur + "</b>")
+    if note:
+        rows.append("пометка: <i>" + esc(str(note)) + "</i>")
     return "\n".join(rows)
 
 
-def inv_item_label(it, mark) -> str:
-    icon = {INV_OK: "✅", INV_MISS: "❌"}.get(mark or "", "⬜")
+def inv_item_label(it, mark, note=None) -> str:
+    icon = {INV_OK: "✅", INV_MISS: "❌", INV_SOLD: "💸"}.get(mark or "", "📝" if note else "⬜")
     name = str(it.get("product") or "?")
     tail = fmt_money(it.get("cost") or 0)
     room = 58 - len(icon) - len(tail) - 3
@@ -2900,7 +2917,7 @@ def inv_home(chat_id):
         "page": 0,
     }
     persist_sess()
-    total, ok, miss = inv_counts(inv)
+    total, ok, miss, sold = inv_counts(inv)
     started = str(inv.get("started") or "")[:16].replace("T", " ")
     ui(
         chat_id,
@@ -2911,13 +2928,15 @@ def inv_home(chat_id):
         + " · "
         + started
         + "\nотмечено <b>"
-        + str(ok + miss)
+        + str(ok + miss + sold)
         + "</b> из <b>"
         + str(total)
         + "</b> · ✅ "
         + str(ok)
         + " · ❌ "
-        + str(miss),
+        + str(miss)
+        + " · 💸 "
+        + str(sold),
         kb(
             [
                 [btn("продолжить", "iv:cats")],
@@ -2930,7 +2949,7 @@ def inv_home(chat_id):
 
 
 def inv_foreign(chat_id, inv):
-    total, ok, miss = inv_counts(inv)
+    total, ok, miss, sold = inv_counts(inv)
     started = str(inv.get("started") or "")[:16].replace("T", " ")
     ui(
         chat_id,
@@ -2941,7 +2960,7 @@ def inv_foreign(chat_id, inv):
         + " · "
         + started
         + "\nотмечено "
-        + str(ok + miss)
+        + str(ok + miss + sold)
         + " из "
         + str(total)
         + "\n\nвторую не начну — дождись завершения.",
@@ -3022,11 +3041,11 @@ def inv_categories(chat_id):
     rows.append([btn("все · %s" % len(items), "iv:c:all")])
     rows.append([btn("🏁 завершить", "iv:fin")])
     rows.append(nav_row())
-    total, ok, miss = inv_counts(inv)
+    total, ok, miss, sold = inv_counts(inv)
     ui(
         chat_id,
-        "<b>Инвентаризация</b>\nотмечено %d из %d · ✅ %d · ❌ %d\n\nчто смотрим?"
-        % (ok + miss, total, ok, miss),
+        "<b>Инвентаризация</b>\nотмечено %d из %d · ✅ %d · ❌ %d · 💸 %d\n\nчто смотрим?"
+        % (ok + miss + sold, total, ok, miss, sold),
         kb(rows),
     )
 
@@ -3038,6 +3057,7 @@ def inv_list(chat_id, page=0, force_new=False):
     s = sess(chat_id)
     items = filtered_items(s)
     marks = inv.get("marks") or {}
+    notes = inv.get("notes") or {}
     if not items:
         ui(chat_id, "по этому фильтру ничего нет.", kb([[btn("‹ категории", "iv:cats")]]))
         return
@@ -3051,7 +3071,7 @@ def inv_list(chat_id, page=0, force_new=False):
     rows = []
     for it in items[page * PAGE : (page + 1) * PAGE]:
         mark = marks.get(str(it.get("row")))
-        rows.append([btn(inv_item_label(it, mark), "iv:it:" + str(it.get("row")))])
+        rows.append([btn(inv_item_label(it, mark, notes.get(str(it.get("row")))), "iv:it:" + str(it.get("row")))])
     nav = []
     if page > 0:
         nav.append(btn("‹", "iv:pg:%d" % (page - 1)))
@@ -3061,7 +3081,7 @@ def inv_list(chat_id, page=0, force_new=False):
     rows.append(nav)
     rows.append([btn("‹ категории", "iv:cats"), btn("🔍 поиск", "iv:srch")])
     rows.append([btn("🏁 завершить", "iv:fin")])
-    total, ok, miss = inv_counts(inv)
+    total, ok, miss, sold = inv_counts(inv)
     q = s.get("query") or ""
     cat = s.get("filter_cat")
     bits = ["%s шт." % len(items)]
@@ -3071,8 +3091,8 @@ def inv_list(chat_id, page=0, force_new=False):
         bits.append("«" + q + "»")
     ui(
         chat_id,
-        "<b>Инвентаризация</b>\nотмечено %d из %d · ✅ %d · ❌ %d\n\n%s"
-        % (ok + miss, total, ok, miss, " · ".join(bits)),
+        "<b>Инвентаризация</b>\nотмечено %d из %d · ✅ %d · ❌ %d · 💸 %d\n\n%s"
+        % (ok + miss + sold, total, ok, miss, sold, " · ".join(bits)),
         kb(rows),
         force_new=force_new,
     )
@@ -3107,12 +3127,14 @@ def inv_item(chat_id, row: int):
     s["inv_row"] = row
     persist_sess()
     marks = inv.get("marks") or {}
+    notes = inv.get("notes") or {}
     ui(
         chat_id,
-        inv_item_card(picked, marks.get(str(row))),
+        inv_item_card(picked, marks.get(str(row)), notes.get(str(row))),
         kb(
             [
                 [btn("✔️ на месте", "iv:ok:" + str(row)), btn("❌ отсутствует", "iv:no:" + str(row))],
+                [btn("💸 продано", "iv:sold:" + str(row)), btn("📝 пометка", "iv:note:" + str(row))],
                 [btn("‹ к списку", "iv:back")],
             ]
         ),
@@ -3129,6 +3151,38 @@ def inv_mark(chat_id, row: int, mark: str):
     inv_list(chat_id, sess(chat_id).get("page") or 0)
 
 
+def inv_ask_note(chat_id, row: int):
+    if not inv_guard(chat_id):
+        return
+    inv = inv_state()
+    s = sess(chat_id)
+    s["step"] = "inv_note"
+    s["inv_row"] = row
+    persist_sess()
+    note = (inv.get("notes") or {}).get(str(row)) or ""
+    ui(
+        chat_id,
+        "📝 <b>Пометка к лоту</b>"
+        + ("\n\nсейчас: <i>" + esc(note) + "</i>" if note else "")
+        + "\n\nнапиши текст — что угодно, до 100 символов.",
+        kb(
+            [
+                [btn("🗑 стереть пометку", "iv:ndel:" + str(row))],
+                [btn("‹ к лоту", "iv:it:" + str(row))],
+            ]
+        ),
+    )
+
+
+def inv_note_delete(chat_id, row: int):
+    if not inv_guard(chat_id):
+        return
+    inv = inv_state()
+    (inv.get("notes") or {}).pop(str(row), None)
+    persist_sess()
+    inv_item(chat_id, row)
+
+
 def inv_finish(chat_id):
     if not inv_guard(chat_id):
         return
@@ -3136,8 +3190,8 @@ def inv_finish(chat_id):
     s = sess(chat_id)
     s["step"] = "inv_fin"
     persist_sess()
-    total, ok, miss = inv_counts(inv)
-    unmarked = total - ok - miss
+    total, ok, miss, sold = inv_counts(inv)
+    unmarked = total - ok - miss - sold
     rows = [
         "🏁 <b>Завершить инвентаризацию?</b>",
         HR,
@@ -3145,6 +3199,8 @@ def inv_finish(chat_id):
         "✅ на месте     " + str(ok),
         "❌ отсутствует  " + str(miss),
     ]
+    if sold:
+        rows.append("💸 продано       " + str(sold))
     if unmarked > 0:
         rows.append("⬜ не отмечено   " + str(unmarked) + " — посчитаю отсутствующими")
     ui(
@@ -3168,9 +3224,10 @@ def inv_finish_confirm(chat_id, force=False):
     if inv.get("by") != chat_id:
         inv_foreign(chat_id, inv)
         return
-    total, ok, miss = inv_counts(inv)
+    total, ok, miss, sold = inv_counts(inv)
     marks = inv.get("marks") or {}
-    unmarked = total - ok - miss
+    notes = inv.get("notes") or {}
+    unmarked = total - ok - miss - sold
     items = []
     for it in inv.get("items") or []:
         m = marks.get(str(it.get("row")))
@@ -3178,6 +3235,8 @@ def inv_finish_confirm(chat_id, force=False):
             status = INV_SHEET_OK
         elif m == INV_MISS:
             status = INV_SHEET_MISS
+        elif m == INV_SOLD:
+            status = INV_SHEET_SOLD
         else:
             status = INV_SHEET_UNMARKED
         items.append(
@@ -3187,6 +3246,7 @@ def inv_finish_confirm(chat_id, force=False):
                 "buy": str(it.get("buy") or ""),
                 "cost": int(it.get("cost") or 0),
                 "status": status,
+                "note": str(notes.get(str(it.get("row"))) or ""),
             }
         )
     period = period_str()
@@ -3228,18 +3288,34 @@ def inv_finish_confirm(chat_id, force=False):
         "✅ на месте  " + str(ok),
         "❌ отсутствует  " + str(miss + unmarked),
     ]
+    if sold:
+        rows.append("💸 продано       " + str(sold))
     if saved:
         rows.append("<i>записал в таблицу, лист «Инвентаризация».</i>")
     else:
         rows.append("<i>в таблицу не записывал — закончено без записи.</i>")
-    gone = [it for it in items if it["status"] != INV_SHEET_OK]
+    gone = [it for it in items if it["status"] == INV_SHEET_MISS or it["status"] == INV_SHEET_UNMARKED]
     if gone:
         rows.append("")
         rows.append("<b>отсутствуют:</b>")
         for it in gone[:15]:
-            rows.append("• " + esc(it["product"]) + " · " + fmt_money(it["cost"]))
+            tail = " · " + fmt_money(it["cost"])
+            if it.get("note"):
+                tail += " · " + it["note"]
+            rows.append("• " + esc(it["product"]) + tail)
         if len(gone) > 15:
             rows.append("<i>и ещё " + str(len(gone) - 15) + "</i>")
+    sold_list = [it for it in items if it["status"] == INV_SHEET_SOLD]
+    if sold_list:
+        rows.append("")
+        rows.append("<b>продано (внеси в таблицу):</b>")
+        for it in sold_list[:15]:
+            tail = " · " + fmt_money(it["cost"])
+            if it.get("note"):
+                tail += " · " + it["note"]
+            rows.append("• " + esc(it["product"]) + tail)
+        if len(sold_list) > 15:
+            rows.append("<i>и ещё " + str(len(sold_list) - 15) + "</i>")
     go_menu(chat_id, "\n".join(rows))
 
 
@@ -3303,8 +3379,8 @@ def inv_history(chat_id):
     rows = []
     inv = inv_state()
     if inv:
-        total, ok, miss = inv_counts(inv)
-        rows.append([btn("🟡 идёт сейчас · %d/%d" % (ok + miss, total), "iv:home")])
+        total, ok, miss, sold = inv_counts(inv)
+        rows.append([btn("🟡 идёт сейчас · %d/%d" % (ok + miss + sold, total), "iv:home")])
     for p in sorted(done, reverse=True):
         e = done[p]
         label = "%s · всего %s · ❌ %s" % (period_label(p), e.get("total") or "?", e.get("miss") or "?")
@@ -3532,6 +3608,27 @@ def on_inv_callback(chat_id, data):
         except ValueError:
             return
         inv_mark(chat_id, row, INV_MISS)
+        return
+    if data.startswith("iv:sold:"):
+        try:
+            row = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            return
+        inv_mark(chat_id, row, INV_SOLD)
+        return
+    if data.startswith("iv:note:"):
+        try:
+            row = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            return
+        inv_ask_note(chat_id, row)
+        return
+    if data.startswith("iv:ndel:"):
+        try:
+            row = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            return
+        inv_note_delete(chat_id, row)
         return
     if data.startswith("iv:fix:"):
         parts = data.split(":")

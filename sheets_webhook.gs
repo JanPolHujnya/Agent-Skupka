@@ -763,15 +763,16 @@ function invSave_(ss, b) {
         Number(it.cost || 0),
         Number(it.sheet_row || 0),
         st,
-        ''
+        String(it.note || '')
       ]);
     }
     var r0 = nextRow_(sh, 10, 9);
     sh.getRange(r0, 10, out.length, 9).setValues(out);
     sh.getRange(r0, 11, out.length, 1).setNumberFormat('dd.mm.yyyy');
     for (var j = 0; j < out.length; j++) {
-      var isOk = out[j][7].indexOf('✅') === 0;
-      sh.getRange(r0 + j, 17).setBackground(isOk ? INV_C_GO : INV_C_MISS);
+      var stJ = out[j][7];
+      var bgJ = stJ.indexOf('✅') === 0 ? INV_C_GO : (stJ.indexOf('💸') === 0 ? INV_C_WAIT : INV_C_MISS);
+      sh.getRange(r0 + j, 17).setBackground(bgJ);
     }
     wrote = out.length;
   }
