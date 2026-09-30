@@ -360,6 +360,28 @@ function doPost(e) {
     cacheDrop_();
     return json_({ok: true, q5: vSS});
   }
+  // возврат кассы из «Касса архив» на живой лист (обратная month_close по кассе,
+  // архив НЕ чистится — остаётся как бэкап). Q5 = body.q5 (старт до закрытия)
+  if (action === 'kassa_restore') {
+    if (!sales || !kassa) return json_({ok: false, error: 'no sheets'});
+    var archKR = ss.getSheetByName('Касса архив');
+    if (!archKR) return json_({ok: false, error: 'no archive'});
+    var lastAR = archKR.getLastRow();
+    if (lastAR < 2) return json_({ok: true, restored: 0});
+    var vAR = archKR.getRange(2, 1, lastAR - 1, 5).getValues();
+    var rowsKR = [];
+    for (var iKR = 0; iKR < vAR.length; iKR++) {
+      if (!vAR[iKR][0] && !vAR[iKR][2] && !vAR[iKR][3]) continue;
+      rowsKR.push(vAR[iKR]);
+    }
+    var lastKR = nextRow_(kassa, 2, 9) - 1;
+    if (lastKR >= 10) kassa.getRange(10, 1, lastKR - 9, 5).clearContent();
+    if (rowsKR.length) kassa.getRange(10, 1, rowsKR.length, 5).setValues(rowsKR);
+    var q5KR = Number(body.q5 || 0);
+    if (body.q5 !== undefined) sales.getRange('Q5').setValue(q5KR).setNumberFormat('#,##0');
+    cacheDrop_();
+    return json_({ok: true, restored: rowsKR.length, q5: q5KR});
+  }
   // уплотнение «Продажей»: непустые строки подряд с 9-й, формулу % пересоздаём
   // под новую строку (она ссылается на свою же), всё что ниже — очищается
   if (action === 'sales_defrag') {
