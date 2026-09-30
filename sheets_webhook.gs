@@ -351,6 +351,15 @@ function doPost(e) {
     var gridD = shD.getRange(1, 1, Math.min(rowsD, shD.getLastRow() || 1), Math.min(colsD, shD.getMaxColumns() || 1)).getDisplayValues();
     return json_({ok: true, grid: gridD});
   }
+  // ручная установка входящего остатка Q5 «Продажи» (напр. после архивации кассы,
+  // когда Q5 затёрся и бот показывает дефолтные 14400)
+  if (action === 'set_start') {
+    if (!sales) return json_({ok: false, error: 'no sheet'});
+    var vSS = Number(body.value || 0);
+    sales.getRange('Q5').setValue(vSS).setNumberFormat('#,##0');
+    cacheDrop_();
+    return json_({ok: true, q5: vSS});
+  }
   // уплотнение «Продажей»: непустые строки подряд с 9-й, формулу % пересоздаём
   // под новую строку (она ссылается на свою же), всё что ниже — очищается
   if (action === 'sales_defrag') {
@@ -395,6 +404,42 @@ function doPost(e) {
       }
     }
     return json_({ok: true, written: doneMS});
+  }
+  // read-only: типы и значения первых ячеек строки «Продажи» (диагностика дат)
+  if (action === 'probe_row') {
+    var rowPR = Number(body.row || 0);
+    if (!rowPR || rowPR < 9) return json_({ok: false, error: 'bad row'});
+    var vPR = sales.getRange(rowPR, 1, 1, 5).getValues()[0];
+    var typesPR = [];
+    for (var tPR = 0; tPR < 5; tPR++) {
+      typesPR.push(Object.prototype.toString.call(vPR[tPR]).replace('[object ', '').replace(']', ''));
+    }
+    return json_({ok: true, row: rowPR, types: typesPR,
+      values: [String(vPR[0] || ''), String(vPR[1] || ''), String(vPR[2] || ''), String(vPR[3] || ''), String(vPR[4] || '')]});
+  }
+  // записать НАСТОЯЩУЮ дату закупа (Date, не текст) в строку лота
+  if (action === 'set_buy_date') {
+    if (!sales) return json_({ok: false, error: 'no sheet'});
+    var rowSD = Number(body.row || 0);
+    var dSD = parseDate_(body.date);
+    if (!rowSD || rowSD < 9 || !dSD) return json_({ok: false, error: 'bad args', date: String(body.date)});
+    sales.getRange(rowSD, 3).setValue(dSD).setNumberFormat('dd.mm.yyyy');
+    sales.getRange(rowSD, 2).setValue(monthName_(dSD));
+    cacheDrop_();
+    return json_({ok: true, row: rowSD, date: formatDate_(dSD)});
+  }
+  // восстановить строку лота в «Продажи» (body.row, body.vals — 22 значения A..V)
+  if (action === 'restore_row') {
+    if (!sales) return json_({ok: false, error: 'no sheet'});
+    var rowRR = Number(body.row || 0);
+    var valsRR = body.vals || [];
+    if (!rowRR || rowRR < 9 || valsRR.length !== 22) return json_({ok: false, error: 'bad args'});
+    sales.getRange(rowRR, 1, 1, 22).setValues([valsRR]);
+    sales.getRange(rowRR, 3).setNumberFormat('dd.mm.yyyy');
+    var fRR = '=ARRAY_CONSTRAIN(ARRAYFORMULA(IF(K' + rowRR + '="";"";IFERROR(INDEX(\'Правила\'!$B$5:$B$10;MATCH(K' + rowRR + ';\'Правила\'!$A$5:$A$10;0));""))); 1; 1)';
+    sales.getRange(rowRR, COL_PCT).setFormula(fRR).setNumberFormat('0%');
+    cacheDrop_();
+    return json_({ok: true, restored: rowRR, product: String(valsRR[4] || '')});
   }
   // разовая починка (идемпотентна): K канонизируем под тексты «Правил»,
   // в L восстанавливаем формулу % там, где её затёр бот
