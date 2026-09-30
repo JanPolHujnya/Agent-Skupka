@@ -283,6 +283,66 @@ function doPost(e) {
     cacheDrop_();
     return json_({ok: true, kept: keepC, details: keepDetC.length});
   }
+  // закрытие месяца: касса -> лист «Касса архив» и очистка, проданные лоты ->
+  // лист «Архив продаж» и очистка строк (позиции непроданных не сдвигаются),
+  // старт Q5 = текущий остаток «На руках» (входящий остаток нового месяца)
+  if (action === 'month_close') {
+    if (!sales || !kassa) return json_({ok: false, error: 'no sheets'});
+    var resMC = {kassa_rows: 0, inn: 0, out: 0, new_start: 0, sales_archived: 0};
+    var startMC = num_(sales.getRange('Q5').getValue());
+    var archKMC = ss.getSheetByName('Касса архив');
+    if (!archKMC) {
+      archKMC = ss.insertSheet('Касса архив');
+      archKMC.getRange(1, 1, 1, 5).setValues([['Дата', 'Что', 'Пришло', 'Ушло', 'Комментарий']]).setFontWeight('bold');
+    }
+    var lastKM = nextRow_(kassa, 2, 9) - 1;
+    if (lastKM >= 10) {
+      var kvMC = kassa.getRange(10, 1, lastKM - 9, 5).getValues();
+      var rowsMC = [];
+      for (var iMC = 0; iMC < kvMC.length; iMC++) {
+        if (!kvMC[iMC][0] && !kvMC[iMC][2] && !kvMC[iMC][3]) continue;
+        resMC.inn += num_(kvMC[iMC][2]);
+        resMC.out += num_(kvMC[iMC][3]);
+        rowsMC.push(kvMC[iMC]);
+      }
+      if (rowsMC.length) {
+        var stKMC = (archKMC.getLastRow() || 1) + (archKMC.getLastRow() ? 1 : 0);
+        archKMC.getRange(stKMC, 1, rowsMC.length, 5).setValues(rowsMC);
+        resMC.kassa_rows = rowsMC.length;
+      }
+      kassa.getRange(10, 1, lastKM - 9, 5).clearContent();
+    }
+    var newStartMC = startMC + resMC.inn - resMC.out;
+    sales.getRange('Q5').setValue(newStartMC).setNumberFormat('#,##0');
+    resMC.new_start = newStartMC;
+    var archSMC = ss.getSheetByName('Архив продаж');
+    if (!archSMC) {
+      archSMC = ss.insertSheet('Архив продаж');
+      var hdrSMC = sales.getRange(8, 1, 1, 22).getValues()[0];
+      archSMC.getRange(1, 1, 1, hdrSMC.length).setValues([hdrSMC]).setFontWeight('bold');
+      archSMC.getRange(1, hdrSMC.length + 1).setValue('исходная строка');
+    }
+    var lastSMC = lastDataRow_(sales);
+    if (lastSMC >= 9) {
+      var vSMC = sales.getRange(9, 1, lastSMC - 8, 22).getValues();
+      var archSMCRows = [];
+      for (var jMC = 0; jMC < vSMC.length; jMC++) {
+        if (!vSMC[jMC][3]) continue; // архивируем только строки с датой продажи
+        var recMC = vSMC[jMC].slice();
+        recMC.push(9 + jMC);
+        archSMCRows.push(recMC);
+        sales.getRange(9 + jMC, 1, 1, 22).clearContent();
+        resMC.sales_archived++;
+      }
+      if (archSMCRows.length) {
+        var stSMC = archSMC.getLastRow() + 1;
+        archSMC.getRange(stSMC, 1, archSMCRows.length, 23).setValues(archSMCRows);
+      }
+    }
+    cacheDrop_();
+    return json_({ok: true, kassa_rows: resMC.kassa_rows, kassa_in: resMC.inn, kassa_out: resMC.out,
+      new_start: resMC.new_start, sales_archived: resMC.sales_archived});
+  }
   // разовая починка (идемпотентна): K канонизируем под тексты «Правил»,
   // в L восстанавливаем формулу % там, где её затёр бот
   if (action === 'roles_fix') {
