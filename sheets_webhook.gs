@@ -343,6 +343,59 @@ function doPost(e) {
     return json_({ok: true, kassa_rows: resMC.kassa_rows, kassa_in: resMC.inn, kassa_out: resMC.out,
       new_start: resMC.new_start, sales_archived: resMC.sales_archived});
   }
+  // read-only: вывести сетку любого листа (display-значения), для осмотра
+  if (action === 'dump') {
+    var shD = ss.getSheetByName(String(body.sheet || ''));
+    if (!shD) return json_({ok: false, error: 'no sheet', sheets: ss.getSheets().map(function (s) { return s.getName(); })});
+    var rowsD = Number(body.rows || 30), colsD = Number(body.cols || 10);
+    var gridD = shD.getRange(1, 1, Math.min(rowsD, shD.getLastRow() || 1), Math.min(colsD, shD.getMaxColumns() || 1)).getDisplayValues();
+    return json_({ok: true, grid: gridD});
+  }
+  // уплотнение «Продажей»: непустые строки подряд с 9-й, формулу % пересоздаём
+  // под новую строку (она ссылается на свою же), всё что ниже — очищается
+  if (action === 'sales_defrag') {
+    if (!sales) return json_({ok: false, error: 'no sheet'});
+    var lastDF = lastDataRow_(sales);
+    if (lastDF < 9) return json_({ok: true, moved: 0});
+    var vDF = sales.getRange(9, 1, lastDF - 8, 22).getValues();
+    var keepDF = [];
+    for (var iDF = 0; iDF < vDF.length; iDF++) {
+      if (!vDF[iDF][4] && !vDF[iDF][2]) continue;
+      keepDF.push(vDF[iDF]);
+    }
+    sales.getRange(9, 1, lastDF - 8, 22).clearContent();
+    var fDF = '';
+    for (var kDF = 0; kDF < keepDF.length; kDF++) {
+      var rrDF = 9 + kDF;
+      var rowDF = keepDF[kDF].slice();
+      rowDF[11] = '';
+      sales.getRange(rrDF, 1, 1, 22).setValues([rowDF]);
+      fDF = '=ARRAY_CONSTRAIN(ARRAYFORMULA(IF(K' + rrDF + '="";"";IFERROR(INDEX(\'Правила\'!$B$5:$B$10;MATCH(K' + rrDF + ';\'Правила\'!$A$5:$A$10;0));""))); 1; 1)';
+      sales.getRange(rrDF, COL_PCT).setFormula(fDF).setNumberFormat('0%');
+    }
+    cacheDrop_();
+    return json_({ok: true, kept: keepDF.length, freed: lastDF - 8 - keepDF.length});
+  }
+  // вписать статистику прошлых месяцев в «Месяцы» значениями (body.stats:
+  // [['Август', продано, выручка, cogs, маржа, матвею, данилу], ...])
+  if (action === 'month_stats') {
+    var shMS = ss.getSheetByName('Месяцы');
+    if (!shMS) return json_({ok: false, error: 'no sheet'});
+    var statsMS = body.stats || [];
+    var doneMS = [];
+    var namesMS = shMS.getRange(11, 1, 12, 1).getValues();
+    for (var sMS = 0; sMS < statsMS.length; sMS++) {
+      var recMS = statsMS[sMS];
+      for (var nMS = 0; nMS < 12; nMS++) {
+        if (String(namesMS[nMS][0] || '').toLowerCase() === String(recMS[0] || '').toLowerCase()) {
+          shMS.getRange(11 + nMS, 2, 1, 6).setValues([recMS.slice(1, 7)]);
+          doneMS.push(recMS[0]);
+          break;
+        }
+      }
+    }
+    return json_({ok: true, written: doneMS});
+  }
   // разовая починка (идемпотентна): K канонизируем под тексты «Правил»,
   // в L восстанавливаем формулу % там, где её затёр бот
   if (action === 'roles_fix') {
